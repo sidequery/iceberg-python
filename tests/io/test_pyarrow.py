@@ -37,6 +37,7 @@ import pytest
 from packaging import version
 from pyarrow.fs import AwsDefaultS3RetryStrategy, FileType, LocalFileSystem, S3FileSystem
 
+import pyiceberg.io.pyarrow as pyiceberg_pyarrow
 from pyiceberg.exceptions import ResolveError
 from pyiceberg.expressions import (
     AlwaysFalse,
@@ -1986,6 +1987,35 @@ def test_composite_equality_delete_with_nulls_and_hidden_projection(tmp_path: Pa
     ).to_table(tasks=[FileScanTask(data_file=data_file, delete_files={equality_delete_file})])
 
     assert result.to_pydict() == {"payload": ["keep-a", "keep-null"]}
+
+
+def test_equality_deletes_are_applied_in_bounded_batches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = Schema(NestedField(field_id=1, name="id", field_type=IntegerType(), required=True), schema_id=1)
+    data_path = tmp_path / "data.parquet"
+    delete_path = tmp_path / "eq-delete.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array(range(12), type=pa.int32())}, schema=schema_to_pyarrow(schema)),
+        data_path,
+        row_group_size=3,
+    )
+    delete_values = list(range(0, 12, 2)) * 22_000
+    pq.write_table(pa.table({"id": pa.array(delete_values, type=pa.int32())}), delete_path)
+
+    join_sizes: list[tuple[int, int]] = []
+    original_anti_join = pyiceberg_pyarrow._null_safe_left_anti_join
+
+    def track_join_sizes(data: pa.Table, deletes: pa.Table, keys: list[str]) -> pa.Table:
+        join_sizes.append((data.num_rows, deletes.num_rows))
+        return original_anti_join(data, deletes, keys)
+
+    monkeypatch.setattr(pyiceberg_pyarrow, "_null_safe_left_anti_join", track_join_sizes)
+
+    result = _scan_equality_delete_files(schema, data_path, [delete_path], [1])
+
+    assert result.column("id").to_pylist() == [1, 3, 5, 7, 9, 11]
+    assert len(join_sizes) > 1
+    assert max(data_rows for data_rows, _ in join_sizes) <= 3
+    assert max(delete_rows for _, delete_rows in join_sizes) < len(delete_values)
 
 
 def _scan_equality_delete_files(

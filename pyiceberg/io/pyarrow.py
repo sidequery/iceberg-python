@@ -1157,8 +1157,8 @@ def _read_deletes(io: FileIO, data_file: DataFile) -> dict[str, pa.ChunkedArray]
         raise ValueError(f"Delete file format not supported: {data_file.file_format}")
 
 
-def _read_equality_deletes(io: FileIO, delete_file: DataFile) -> pa.Table:
-    """Read an equality delete file while preserving its field-ID metadata."""
+def _equality_delete_batches(io: FileIO, delete_file: DataFile) -> Iterator[pa.Table]:
+    """Read an equality delete file incrementally while preserving field IDs."""
     if delete_file.file_format not in (FileFormat.PARQUET, FileFormat.ORC):
         raise ValueError(f"Equality delete file format not supported: {delete_file.file_format}")
     if not delete_file.equality_ids:
@@ -1173,9 +1173,9 @@ def _read_equality_deletes(io: FileIO, delete_file: DataFile) -> pa.Table:
         # all columns is the conservative fallback; alignment below still rejects
         # a file that cannot supply every declared equality field.
         columns = projected_columns if len(projected_columns) == len(equality_ids) else None
-        # Delete files are already read concurrently by PyIceberg's executor;
-        # disable nested Arrow threading to avoid oversubscription per file.
-        return ds.Scanner.from_fragment(fragment=fragment, schema=physical_schema, columns=columns, use_threads=False).to_table()
+        scanner = ds.Scanner.from_fragment(fragment=fragment, schema=physical_schema, columns=columns, use_threads=False)
+        for batch in scanner.to_batches():
+            yield pa.Table.from_batches([batch])
 
 
 def _column_name_for_field_id(table: pa.Table, field_id: int, schema: Schema) -> str | None:
@@ -1294,21 +1294,27 @@ def _null_safe_left_anti_join(data: pa.Table, deletes: pa.Table, keys: list[str]
 
 
 def _apply_equality_deletes(
-    data: pa.Table, equality_groups: dict[frozenset[int], list[pa.Table]], table_schema: Schema
+    data: pa.Table, equality_groups: dict[frozenset[int], Iterable[pa.Table]], table_schema: Schema
 ) -> pa.Table:
-    """Apply each distinct equality-key layout once to a record batch."""
+    """Apply equality deletes incrementally to a record batch."""
     for equality_ids, delete_tables in equality_groups.items():
-        aligned_deletes: list[pa.Table] = []
-        join_keys: list[str] | None = None
         for delete_table in delete_tables:
-            data, aligned, keys = _align_equality_delete_table(data, delete_table, equality_ids, table_schema)
-            join_keys = join_keys or keys
-            aligned_deletes.append(aligned.select(keys))
-        if aligned_deletes:
-            deletes = pa.concat_tables(aligned_deletes, promote_options="permissive")
-            data = _null_safe_left_anti_join(data, deletes, join_keys or [])
+            data, aligned, join_keys = _align_equality_delete_table(data, delete_table, equality_ids, table_schema)
+            data = _null_safe_left_anti_join(data, aligned.select(join_keys), join_keys)
             if data.num_rows == 0:
-                break
+                return data
+    return data
+
+
+def _apply_equality_delete_files(io: FileIO, data: pa.Table, delete_files: Iterable[DataFile], table_schema: Schema) -> pa.Table:
+    """Apply equality-delete files without retaining their complete contents."""
+    for delete_file in delete_files:
+        equality_ids = frozenset(delete_file.equality_ids or ())
+        if not equality_ids:
+            continue
+        data = _apply_equality_deletes(data, {equality_ids: _equality_delete_batches(io, delete_file)}, table_schema)
+        if data.num_rows == 0:
+            break
     return data
 
 
@@ -1795,7 +1801,6 @@ def _task_to_record_batches(
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
     downcast_ns_timestamp_to_us: bool | None = None,
     dictionary_columns: tuple[str, ...] = (),
-    equality_delete_tables: dict[DataFile, pa.Table] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     format_kwargs: dict[str, Any] = {"pre_buffer": True, "buffer_size": ONE_MEGABYTE * 8}
     if dictionary_columns and task.file.file_format == FileFormat.PARQUET:
@@ -1828,17 +1833,12 @@ def _task_to_record_batches(
             bound_file_filter = bind(file_schema, translated_row_filter, case_sensitive=case_sensitive)
             pyarrow_filter = expression_to_pyarrow(bound_file_filter, file_schema)
 
-        equality_groups: dict[frozenset[int], list[pa.Table]] = {}
+        equality_delete_files = [
+            delete_file for delete_file in task.delete_files if delete_file.content == DataFileContent.EQUALITY_DELETES
+        ]
         equality_field_ids: set[int] = set()
-        if equality_delete_tables:
-            for delete_file in task.delete_files:
-                if delete_file.content != DataFileContent.EQUALITY_DELETES:
-                    continue
-                equality_table = equality_delete_tables.get(delete_file)
-                if equality_table is not None:
-                    equality_ids = frozenset(delete_file.equality_ids or ())
-                    equality_field_ids.update(equality_ids)
-                    equality_groups.setdefault(equality_ids, []).append(equality_table)
+        for delete_file in equality_delete_files:
+            equality_field_ids.update(delete_file.equality_ids or ())
         file_project_schema = prune_columns(file_schema, projected_field_ids.union(equality_field_ids), select_full_types=False)
 
         fragment_scanner = ds.Scanner.from_fragment(
@@ -1846,7 +1846,7 @@ def _task_to_record_batches(
             schema=physical_schema,
             # This will push down the query to Arrow.
             # But in case there are positional deletes, we have to apply them first
-            filter=pyarrow_filter if not positional_deletes and not equality_groups else None,
+            filter=pyarrow_filter if not positional_deletes and not equality_delete_files else None,
             columns=[col.name for col in file_project_schema.columns],
         )
 
@@ -1862,12 +1862,12 @@ def _task_to_record_batches(
                 indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
                 current_batch = current_batch.take(indices)
 
-            if equality_groups and current_batch.num_rows > 0:
+            if equality_delete_files and current_batch.num_rows > 0:
                 table = pa.Table.from_batches([current_batch])
-                table = _apply_equality_deletes(table, equality_groups, table_schema)
+                table = _apply_equality_delete_files(io, table, equality_delete_files, table_schema)
                 current_batch = table.combine_chunks().to_batches()[0] if table.num_rows > 0 else current_batch.slice(0, 0)
 
-            if (positional_deletes or equality_groups) and pyarrow_filter is not None and current_batch.num_rows > 0:
+            if (positional_deletes or equality_delete_files) and pyarrow_filter is not None and current_batch.num_rows > 0:
                 # Temporary fix until PyArrow 21 is the minimum supported version
                 # (https://github.com/apache/arrow/pull/46057): RecordBatch.filter raises
                 # IndexError on PyArrow <21 when the result is empty; Table.filter does not.
@@ -1909,20 +1909,6 @@ def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[st
                     deletes_per_file[file] = [arr]
 
     return deletes_per_file
-
-
-def _read_all_equality_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[DataFile, pa.Table]:
-    equality_delete_files = {
-        delete_file
-        for delete_file in itertools.chain.from_iterable(task.delete_files for task in tasks)
-        if delete_file.content == DataFileContent.EQUALITY_DELETES
-    }
-    if not equality_delete_files:
-        return {}
-
-    executor = ExecutorFactory.get_or_create()
-    results = executor.map(lambda delete_file: _read_equality_deletes(io, delete_file), equality_delete_files)
-    return dict(zip(equality_delete_files, results, strict=True))
 
 
 class ArrowScan:
@@ -2030,7 +2016,6 @@ class ArrowScan:
         """
         planned_tasks = list(tasks)
         deletes_per_file = _read_all_delete_files(self._io, planned_tasks)
-        equality_deletes = _read_all_equality_delete_files(self._io, planned_tasks)
 
         total_row_count = 0
         executor = ExecutorFactory.get_or_create()
@@ -2039,7 +2024,7 @@ class ArrowScan:
             # Materialize the iterator here to ensure execution happens within the executor.
             # Otherwise, the iterator would be lazily consumed later (in the main thread),
             # defeating the purpose of using executor.map.
-            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file, equality_deletes))
+            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file))
 
         limit_reached = False
         for batches in executor.map(batches_for_task, planned_tasks):
@@ -2062,7 +2047,6 @@ class ArrowScan:
         self,
         tasks: Iterable[FileScanTask],
         deletes_per_file: dict[str, list[ChunkedArray]],
-        equality_deletes: dict[DataFile, pa.Table] | None = None,
     ) -> Iterator[pa.RecordBatch]:
         total_row_count = 0
         for task in tasks:
@@ -2082,7 +2066,6 @@ class ArrowScan:
                 self._table_metadata.format_version,
                 self._downcast_ns_timestamp_to_us,
                 self._dictionary_columns,
-                equality_deletes,
             )
             for batch in batches:
                 if self._limit is not None:
