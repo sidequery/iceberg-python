@@ -17,6 +17,11 @@
 
 # Iceberg Python
 
+> [!NOTE]
+> This branch builds the `sidequery-pyiceberg` distribution maintained by Sidequery. It keeps the
+> `pyiceberg` import package while adding Sidequery's equality-delete read and write support; it is
+> not an Apache PyIceberg release.
+
 PyIceberg is a Python library for programmatic access to Iceberg table metadata as well as to table data in Iceberg format. It is a Python implementation of the [Iceberg table spec](https://iceberg.apache.org/spec/).
 
 The documentation is available at [https://py.iceberg.apache.org/](https://py.iceberg.apache.org/).
