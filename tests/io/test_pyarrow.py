@@ -37,6 +37,7 @@ import pytest
 from packaging import version
 from pyarrow.fs import AwsDefaultS3RetryStrategy, FileType, LocalFileSystem, S3FileSystem
 
+import pyiceberg.io.pyarrow as pyiceberg_pyarrow
 from pyiceberg.exceptions import ResolveError
 from pyiceberg.expressions import (
     AlwaysFalse,
@@ -2069,6 +2070,66 @@ def test_equality_delete_treats_nulls_as_equal(tmp_path: str) -> None:
     ).to_table(tasks=[task])
 
     assert result.column("id").to_pylist() == [1, 3]
+
+
+def test_equality_deletes_are_applied_in_bounded_batches(tmp_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = Schema(NestedField(field_id=1, name="id", field_type=IntegerType(), required=True), schema_id=1)
+    data_path = f"{tmp_path}/data.parquet"
+    deletes_path = f"{tmp_path}/eq-deletes.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array(range(12), type=pa.int32())}, schema=schema_to_pyarrow(schema)),
+        data_path,
+        row_group_size=3,
+    )
+    delete_values = list(range(0, 12, 2)) * 22_000
+    pq.write_table(pa.table({"id": pa.array(delete_values, type=pa.int32())}), deletes_path)
+
+    join_sizes: list[tuple[int, int]] = []
+    original_anti_join = pyiceberg_pyarrow._null_safe_anti_join
+
+    def track_join_sizes(data: pa.Table, deletes: pa.Table, join_keys: list[str]) -> pa.Table:
+        join_sizes.append((data.num_rows, deletes.num_rows))
+        return original_anti_join(data, deletes, join_keys)
+
+    monkeypatch.setattr(pyiceberg_pyarrow, "_null_safe_anti_join", track_join_sizes)
+
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=data_path,
+        file_format=FileFormat.PARQUET,
+        record_count=12,
+        file_size_in_bytes=os.path.getsize(data_path),
+    )
+    data_file.spec_id = 0
+    task = FileScanTask(
+        data_file=data_file,
+        delete_files={
+            DataFile.from_args(
+                content=DataFileContent.EQUALITY_DELETES,
+                file_path=deletes_path,
+                file_format=FileFormat.PARQUET,
+                equality_ids=[1],
+            )
+        },
+    )
+    result = ArrowScan(
+        table_metadata=TableMetadataV2(
+            location="file://a/b/c.json",
+            last_column_id=1,
+            format_version=2,
+            current_schema_id=1,
+            schemas=[schema],
+            partition_specs=[PartitionSpec()],
+        ),
+        io=load_file_io(),
+        projected_schema=schema,
+        row_filter=AlwaysTrue(),
+    ).to_table(tasks=[task])
+
+    assert result.column("id").to_pylist() == [1, 3, 5, 7, 9, 11]
+    assert len(join_sizes) > 1
+    assert max(data_rows for data_rows, _ in join_sizes) <= 3
+    assert max(delete_rows for _, delete_rows in join_sizes) < len(delete_values)
 
 
 def _scan_equality_task(schema: Schema, data_path: str, deletes_path: str, equality_ids: list[int]) -> pa.Table:
