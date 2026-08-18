@@ -2051,6 +2051,7 @@ class ArrowScan:
                         break
                     if isinstance(item, BaseException):
                         raise item
+                    assert isinstance(item, pa.RecordBatch)
                     batch = item
                     current_batch_size = len(batch)
                     if self._limit is not None and total_row_count + current_batch_size >= self._limit:
