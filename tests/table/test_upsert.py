@@ -226,6 +226,42 @@ def test_empty_equality_delete_upsert_does_not_create_snapshot(catalog: InMemory
     assert table.current_snapshot() is None
 
 
+def test_equality_delete_upsert_supports_delete_only_rows(catalog: InMemoryCatalog) -> None:
+    initial = pa.table({"id": pa.array([1, 2, 3], type=pa.int64()), "value": ["one", "two", "three"]})
+    table = catalog.create_table("default.equality_delete_only", initial.schema)
+    table.append(initial)
+
+    table.upsert_by_equality_delete(
+        initial.schema.empty_table(),
+        join_cols=["id"],
+        delete_df=pa.table({"id": pa.array([2], type=pa.int64())}),
+    )
+
+    assert table.scan().to_arrow().sort_by("id").to_pydict() == {"id": [1, 3], "value": ["one", "three"]}
+
+
+def test_equality_delete_upsert_commits_replacements_and_delete_only_rows_together(catalog: InMemoryCatalog) -> None:
+    initial = pa.table({"id": pa.array([1, 2, 3], type=pa.int64()), "value": ["one", "two", "three"]})
+    table = catalog.create_table("default.equality_replace_and_delete", initial.schema)
+    table.append(initial)
+    previous_snapshot = table.current_snapshot()
+    assert previous_snapshot is not None
+
+    table.upsert_by_equality_delete(
+        pa.table({"id": pa.array([1, 4], type=pa.int64()), "value": ["updated", "four"]}),
+        join_cols=["id"],
+        delete_df=pa.table({"id": pa.array([2], type=pa.int64())}),
+    )
+
+    current_snapshot = table.current_snapshot()
+    assert current_snapshot is not None
+    assert current_snapshot.parent_snapshot_id == previous_snapshot.snapshot_id
+    assert table.scan().to_arrow().sort_by("id").to_pydict() == {
+        "id": [1, 3, 4],
+        "value": ["updated", "three", "four"],
+    }
+
+
 def test_partitioned_equality_delete_upsert_requires_partition_source_in_key(catalog: InMemoryCatalog) -> None:
     schema = Schema(
         NestedField(1, "id", IntegerType(), required=True),

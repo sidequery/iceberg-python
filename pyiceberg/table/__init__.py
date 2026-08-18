@@ -996,8 +996,13 @@ class Transaction:
         case_sensitive: bool = True,
         branch: str | None = MAIN_BRANCH,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
+        delete_df: pa.Table | None = None,
     ) -> None:
         """Atomically commit source-key deletes and replacement rows in one snapshot.
+
+        ``df`` contains replacement rows: their keys are deleted and the rows are
+        appended. ``delete_df`` optionally contains delete-only rows; only its key
+        columns are written to the equality-delete file.
 
         Snapshot visibility is atomic: readers see either the previous snapshot or
         both the equality deletes and replacement data. Physical files are written
@@ -1025,6 +1030,8 @@ class Transaction:
 
         if not isinstance(df, pa.Table):
             raise ValueError(f"Expected pa.Table, got: {df}")
+        if delete_df is not None and not isinstance(delete_df, pa.Table):
+            raise ValueError(f"Expected delete_df to be pa.Table, got: {delete_df}")
 
         if join_cols is None:
             join_cols = []
@@ -1035,9 +1042,6 @@ class Transaction:
                 join_cols.append(column_name)
         if not join_cols:
             raise ValueError("Join columns could not be found, please set identifier-field-ids or pass in explicitly.")
-        if upsert_util.has_duplicate_rows(df, join_cols):
-            raise ValueError("Duplicate rows found in source dataset based on the key columns. No upsert executed")
-
         downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         _check_pyarrow_schema_compatible(
             self.table_metadata.schema(),
@@ -1045,7 +1049,19 @@ class Transaction:
             downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
             format_version=self.table_metadata.format_version,
         )
-        if df.num_rows == 0:
+        delete_key_tables = [df.select(join_cols)]
+        if delete_df is not None:
+            _check_pyarrow_schema_compatible(
+                self.table_metadata.schema().select(*join_cols, case_sensitive=case_sensitive),
+                provided_schema=delete_df.select(join_cols).schema,
+                downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+                format_version=self.table_metadata.format_version,
+            )
+            delete_key_tables.append(delete_df.select(join_cols))
+        delete_rows = pa.concat_tables(delete_key_tables)
+        if upsert_util.has_duplicate_rows(delete_rows, join_cols):
+            raise ValueError("Duplicate rows found in source datasets based on the key columns. No upsert executed")
+        if delete_rows.num_rows == 0:
             return
         if not self.table_metadata.spec().is_unpartitioned() and len(self.table_metadata.specs()) > 1:
             raise NotImplementedError("Equality-delete upserts do not yet support evolved partition specs")
@@ -1059,21 +1075,25 @@ class Transaction:
         equality_delete_files = list(
             _dataframe_to_equality_delete_files(
                 table_metadata=self.table_metadata,
-                df=df,
+                df=delete_rows,
                 equality_ids=equality_ids,
                 io=self._table.io,
                 write_uuid=commit_uuid,
                 counter=counter,
             )
         )
-        data_files = list(
-            _dataframe_to_data_files(
-                table_metadata=self.table_metadata,
-                df=df,
-                io=self._table.io,
-                write_uuid=commit_uuid,
-                counter=counter,
+        data_files = (
+            list(
+                _dataframe_to_data_files(
+                    table_metadata=self.table_metadata,
+                    df=df,
+                    io=self._table.io,
+                    write_uuid=commit_uuid,
+                    counter=counter,
+                )
             )
+            if df.num_rows > 0
+            else []
         )
 
         with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).row_delta() as row_delta:
@@ -1803,12 +1823,14 @@ class Table:
         case_sensitive: bool = True,
         branch: str | None = MAIN_BRANCH,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
+        delete_df: pa.Table | None = None,
     ) -> None:
         """Atomically commit equality deletes and replacement rows; see the transaction API for semantics."""
         with self.transaction() as tx:
             tx.upsert_by_equality_delete(
                 df=df,
                 join_cols=join_cols,
+                delete_df=delete_df,
                 case_sensitive=case_sensitive,
                 branch=branch,
                 snapshot_properties=snapshot_properties,
