@@ -1175,9 +1175,7 @@ def _read_equality_deletes(io: FileIO, delete_file: DataFile) -> pa.Table:
         columns = projected_columns if len(projected_columns) == len(equality_ids) else None
         # Delete files are already read concurrently by PyIceberg's executor;
         # disable nested Arrow threading to avoid oversubscription per file.
-        return ds.Scanner.from_fragment(
-            fragment=fragment, schema=physical_schema, columns=columns, use_threads=False
-        ).to_table()
+        return ds.Scanner.from_fragment(fragment=fragment, schema=physical_schema, columns=columns, use_threads=False).to_table()
 
 
 def _column_name_for_field_id(table: pa.Table, field_id: int, schema: Schema) -> str | None:
@@ -1291,9 +1289,7 @@ def _null_safe_left_anti_join(data: pa.Table, deletes: pa.Table, keys: list[str]
             join_columns.append(nan_key)
             temporary_columns.append(nan_key)
 
-    joined = data_join.join(
-        delete_join.select(join_columns), keys=join_columns, join_type="left anti", use_threads=False
-    )
+    joined = data_join.join(delete_join.select(join_columns), keys=join_columns, join_type="left anti", use_threads=False)
     return joined.drop(temporary_columns)
 
 
@@ -3265,9 +3261,7 @@ def _dataframe_to_equality_delete_files(
         raise ValueError("At least one equality field ID is required")
 
     table_schema = table_metadata.schema()
-    missing_partition_sources = {
-        field.source_id for field in table_metadata.spec().fields if field.source_id not in equality_ids
-    }
+    missing_partition_sources = {field.source_id for field in table_metadata.spec().fields if field.source_id not in equality_ids}
     if missing_partition_sources:
         missing_names = sorted(table_schema.find_field(field_id).name for field_id in missing_partition_sources)
         raise ValueError(
@@ -3290,6 +3284,7 @@ def _dataframe_to_equality_delete_files(
         property_name=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
         default=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
     )
+    assert target_file_size is not None
     name_mapping = table_schema.name_mapping
 
     def write_partition(delete_rows: pa.Table, partition_key: PartitionKey | None) -> Iterable[DataFile]:

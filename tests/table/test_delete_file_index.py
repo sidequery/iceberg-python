@@ -292,15 +292,9 @@ def test_equality_delete_metrics_filtering() -> None:
     )
     index.add_delete_file(equality_delete)
 
-    before = _create_data_file(
-        lower_bounds={1: to_bytes(IntegerType(), 0)}, upper_bounds={1: to_bytes(IntegerType(), 5)}
-    )
-    overlap = _create_data_file(
-        lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)}
-    )
-    after = _create_data_file(
-        lower_bounds={1: to_bytes(IntegerType(), 25)}, upper_bounds={1: to_bytes(IntegerType(), 30)}
-    )
+    before = _create_data_file(lower_bounds={1: to_bytes(IntegerType(), 0)}, upper_bounds={1: to_bytes(IntegerType(), 5)})
+    overlap = _create_data_file(lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)})
+    after = _create_data_file(lower_bounds={1: to_bytes(IntegerType(), 25)}, upper_bounds={1: to_bytes(IntegerType(), 30)})
     assert index.for_data_file(1, before) == set()
     assert index.for_data_file(1, overlap) == {equality_delete.data_file}
     assert index.for_data_file(1, after) == set()
@@ -310,9 +304,7 @@ def test_equality_delete_metrics_filtering() -> None:
     ("delete_nulls", "data_nulls"),
     [((10, 10), (0, 100)), ((0, 10), (100, 100))],
 )
-def test_equality_delete_prunes_disjoint_null_populations(
-    delete_nulls: tuple[int, int], data_nulls: tuple[int, int]
-) -> None:
+def test_equality_delete_prunes_disjoint_null_populations(delete_nulls: tuple[int, int], data_nulls: tuple[int, int]) -> None:
     index = DeleteFileIndex(Schema(NestedField(1, "id", IntegerType(), required=False)))
     equality_delete = _create_equality_delete(
         sequence_number=10,
@@ -334,12 +326,8 @@ def test_equality_delete_metrics_after_int_to_long_promotion() -> None:
         upper_bounds={1: to_bytes(IntegerType(), 20)},
     )
     index.add_delete_file(equality_delete)
-    before = _create_data_file(
-        lower_bounds={1: to_bytes(IntegerType(), 0)}, upper_bounds={1: to_bytes(IntegerType(), 5)}
-    )
-    overlap = _create_data_file(
-        lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)}
-    )
+    before = _create_data_file(lower_bounds={1: to_bytes(IntegerType(), 0)}, upper_bounds={1: to_bytes(IntegerType(), 5)})
+    overlap = _create_data_file(lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)})
     assert index.for_data_file(1, before) == set()
     assert index.for_data_file(1, overlap) == {equality_delete.data_file}
 
@@ -353,9 +341,7 @@ def test_equality_delete_dropped_field_is_not_pruned() -> None:
         upper_bounds={1: to_bytes(IntegerType(), 20)},
     )
     index.add_delete_file(equality_delete)
-    data_file = _create_data_file(
-        lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)}
-    )
+    data_file = _create_data_file(lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)})
     assert index.for_data_file(1, data_file) == {equality_delete.data_file}
 
 

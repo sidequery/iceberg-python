@@ -59,6 +59,7 @@ def reset_global_manifests_cache() -> None:
 @pytest.mark.parametrize("format_version", [2, 3])
 def test_equality_ids_use_iceberg_int_wire_type(format_version: int) -> None:
     equality_ids = DATA_FILE_TYPE[format_version].field_by_name("equality_ids")
+    assert equality_ids is not None
     assert isinstance(equality_ids.field_type, ListType)
     assert isinstance(equality_ids.field_type.element_type, IntegerType)
 

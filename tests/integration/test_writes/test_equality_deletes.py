@@ -24,9 +24,7 @@ from pyiceberg.manifest import ManifestContent
 
 
 @pytest.mark.integration
-def test_large_composite_equality_upsert_is_visible_to_spark(
-    session_catalog: Catalog, spark: SparkSession
-) -> None:
+def test_large_composite_equality_upsert_is_visible_to_spark(session_catalog: Catalog, spark: SparkSession) -> None:
     identifier = "default.large_composite_equality_upsert"
     if session_catalog.table_exists(identifier):
         session_catalog.drop_table(identifier)

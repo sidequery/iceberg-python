@@ -167,9 +167,7 @@ def test_composite_equality_delete_upsert_15k_rows(catalog: InMemoryCatalog) -> 
     assert delete_entries[0].data_file.equality_ids == [1, 2]
 
 
-def test_equality_delete_upsert_is_metadata_atomic_on_commit_failure(
-    catalog: InMemoryCatalog, mocker: MockerFixture
-) -> None:
+def test_equality_delete_upsert_is_metadata_atomic_on_commit_failure(catalog: InMemoryCatalog, mocker: MockerFixture) -> None:
     initial = pa.table({"id": pa.array([1, 2], type=pa.int64()), "value": ["one", "two"]})
     source = pa.table({"id": pa.array([2, 3], type=pa.int64()), "value": ["updated", "three"]})
     table = catalog.create_table(
@@ -186,7 +184,9 @@ def test_equality_delete_upsert_is_metadata_atomic_on_commit_failure(
         table.upsert_by_equality_delete(source, join_cols=["id"])
 
     table.refresh()
-    assert table.current_snapshot().snapshot_id == original_snapshot.snapshot_id  # type: ignore[union-attr]
+    current_snapshot = table.current_snapshot()
+    assert current_snapshot is not None
+    assert current_snapshot.snapshot_id == original_snapshot.snapshot_id
     assert table.scan().to_arrow().sort_by("id").to_pydict() == {"id": [1, 2], "value": ["one", "two"]}
 
 

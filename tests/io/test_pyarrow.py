@@ -2050,9 +2050,7 @@ def test_equality_delete_treats_uuid_nulls_as_equal(tmp_path: Path) -> None:
     data_path = tmp_path / "data.parquet"
     delete_path = tmp_path / "delete.parquet"
     kept = uuid.UUID("00000000-0000-0000-0000-000000000001")
-    pq.write_table(
-        pa.table({"id": pa.array([kept, None], type=pa.uuid())}, schema=schema_to_pyarrow(schema)), data_path
-    )
+    pq.write_table(pa.table({"id": pa.array([kept, None], type=pa.uuid())}, schema=schema_to_pyarrow(schema)), data_path)
     pq.write_table(pa.table({"id": pa.array([None], type=pa.uuid())}), delete_path)
 
     result = _scan_equality_delete_files(schema, data_path, [delete_path], [1])
@@ -2065,9 +2063,7 @@ def test_equality_delete_aligns_renamed_fields_by_id(tmp_path: Path) -> None:
     data_path = tmp_path / "data.parquet"
     current_delete_path = tmp_path / "current-delete.parquet"
     renamed_delete_path = tmp_path / "renamed-delete.parquet"
-    pq.write_table(
-        pa.table({"id": pa.array([1, 2, 3], type=pa.int32())}, schema=schema_to_pyarrow(current_schema)), data_path
-    )
+    pq.write_table(pa.table({"id": pa.array([1, 2, 3], type=pa.int32())}, schema=schema_to_pyarrow(current_schema)), data_path)
     pq.write_table(
         pa.table({"id": pa.array([2], type=pa.int32())}, schema=schema_to_pyarrow(current_schema)),
         current_delete_path,
@@ -2077,9 +2073,7 @@ def test_equality_delete_aligns_renamed_fields_by_id(tmp_path: Path) -> None:
         renamed_delete_path,
     )
 
-    result = _scan_equality_delete_files(
-        current_schema, data_path, [current_delete_path, renamed_delete_path], [1]
-    )
+    result = _scan_equality_delete_files(current_schema, data_path, [current_delete_path, renamed_delete_path], [1])
     assert result.column("id").to_pylist() == [1]
 
 
@@ -2092,9 +2086,7 @@ def test_equality_delete_dropped_field_does_not_match_a_partial_key(tmp_path: Pa
     )
     data_path = tmp_path / "data.parquet"
     delete_path = tmp_path / "delete.parquet"
-    pq.write_table(
-        pa.table({"id": pa.array([1], type=pa.int32())}, schema=schema_to_pyarrow(current_schema)), data_path
-    )
+    pq.write_table(pa.table({"id": pa.array([1], type=pa.int32())}, schema=schema_to_pyarrow(current_schema)), data_path)
     pq.write_table(
         pa.table(
             {"id": pa.array([1], type=pa.int32()), "dropped": ["not-null"]},
@@ -2111,9 +2103,7 @@ def test_orc_equality_delete(tmp_path: Path) -> None:
     schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=1)
     data_path = tmp_path / "data.orc"
     delete_path = tmp_path / "delete.orc"
-    orc.write_table(
-        pa.table({"id": pa.array([1, 2, 3], type=pa.int32())}, schema=schema_to_pyarrow(schema)), data_path
-    )
+    orc.write_table(pa.table({"id": pa.array([1, 2, 3], type=pa.int32())}, schema=schema_to_pyarrow(schema)), data_path)
     orc.write_table(pa.table({"id": pa.array([2], type=pa.int32())}, schema=schema_to_pyarrow(schema)), delete_path)
 
     result = _scan_equality_delete_files(schema, data_path, [delete_path], [1], FileFormat.ORC)
@@ -2125,12 +2115,8 @@ def test_equality_delete_casts_promoted_key_types(tmp_path: Path) -> None:
     old_schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=1)
     data_path = tmp_path / "data.parquet"
     delete_path = tmp_path / "delete.parquet"
-    pq.write_table(
-        pa.table({"id": pa.array([1, 2, 3], type=pa.int64())}, schema=schema_to_pyarrow(current_schema)), data_path
-    )
-    pq.write_table(
-        pa.table({"id": pa.array([2], type=pa.int32())}, schema=schema_to_pyarrow(old_schema)), delete_path
-    )
+    pq.write_table(pa.table({"id": pa.array([1, 2, 3], type=pa.int64())}, schema=schema_to_pyarrow(current_schema)), data_path)
+    pq.write_table(pa.table({"id": pa.array([2], type=pa.int32())}, schema=schema_to_pyarrow(old_schema)), delete_path)
 
     result = _scan_equality_delete_files(current_schema, data_path, [delete_path], [1])
     assert result.column("id").to_pylist() == [1, 3]

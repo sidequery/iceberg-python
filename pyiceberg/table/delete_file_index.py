@@ -153,10 +153,9 @@ def _equality_delete_applies_to_data_file(delete_file: DataFile, data_file: Data
             and field_id in data_upper
         ):
             field_type = field.field_type
-            if (
-                from_bytes(field_type, delete_upper[field_id]) < from_bytes(field_type, data_lower[field_id])
-                or from_bytes(field_type, delete_lower[field_id]) > from_bytes(field_type, data_upper[field_id])
-            ):
+            if from_bytes(field_type, delete_upper[field_id]) < from_bytes(field_type, data_lower[field_id]) or from_bytes(
+                field_type, delete_lower[field_id]
+            ) > from_bytes(field_type, data_upper[field_id]):
                 return False
 
     return True

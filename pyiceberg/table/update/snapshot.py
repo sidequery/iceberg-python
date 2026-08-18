@@ -230,16 +230,12 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         def _write_added_manifest() -> list[ManifestFile]:
             files_by_content: dict[ManifestContent, list[DataFile]] = defaultdict(list)
             for data_file in self._added_data_files:
-                manifest_content = (
-                    ManifestContent.DATA if data_file.content == DataFileContent.DATA else ManifestContent.DELETES
-                )
+                manifest_content = ManifestContent.DATA if data_file.content == DataFileContent.DATA else ManifestContent.DELETES
                 files_by_content[manifest_content].append(data_file)
 
             manifests = []
             for manifest_content, data_files in files_by_content.items():
-                with self.new_manifest_writer(
-                    spec=self._transaction.table_metadata.spec(), content=manifest_content
-                ) as writer:
+                with self.new_manifest_writer(spec=self._transaction.table_metadata.spec(), content=manifest_content) as writer:
                     for data_file in data_files:
                         writer.add(
                             ManifestEntry.from_args(
@@ -398,9 +394,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     def spec(self, spec_id: int) -> PartitionSpec:
         return self._transaction.table_metadata.specs()[spec_id]
 
-    def new_manifest_writer(
-        self, spec: PartitionSpec, content: ManifestContent = ManifestContent.DATA
-    ) -> ManifestWriter:
+    def new_manifest_writer(self, spec: PartitionSpec, content: ManifestContent = ManifestContent.DATA) -> ManifestWriter:
         return write_manifest(
             format_version=self._transaction.table_metadata.format_version,
             spec=spec,
@@ -946,9 +940,7 @@ class _ManifestMergeManager(Generic[U]):
         self._merge_enabled = merge_enabled
         self._snapshot_producer = snapshot_producer
 
-    def _group_by_spec_and_content(
-        self, manifests: list[ManifestFile]
-    ) -> dict[tuple[int, ManifestContent], list[ManifestFile]]:
+    def _group_by_spec_and_content(self, manifests: list[ManifestFile]) -> dict[tuple[int, ManifestContent], list[ManifestFile]]:
         groups = defaultdict(list)
         for manifest in manifests:
             groups[(manifest.partition_spec_id, manifest.content)].append(manifest)
