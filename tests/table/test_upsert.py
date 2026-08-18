@@ -20,16 +20,20 @@ import pyarrow as pa
 import pytest
 from datafusion import SessionContext
 from pyarrow import Table as pa_table
+from pytest_mock import MockerFixture
 
 from pyiceberg.catalog import Catalog
-from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.exceptions import CommitFailedException, NoSuchTableError
 from pyiceberg.expressions import AlwaysTrue, And, EqualTo, Reference
 from pyiceberg.expressions.literals import LongLiteral
 from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.manifest import DataFileContent, ManifestContent
+from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table import Table, UpsertResult
+from pyiceberg.table import Table, TableProperties, UpsertResult
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.table.upsert_util import create_match_filter
+from pyiceberg.transforms import IdentityTransform
 from pyiceberg.types import IntegerType, NestedField, StringType, StructType
 from tests.catalog.test_base import InMemoryCatalog
 
@@ -117,6 +121,127 @@ def gen_target_iceberg_table(
 def assert_upsert_result(res: UpsertResult, expected_updated: int, expected_inserted: int) -> None:
     assert res.rows_updated == expected_updated, f"rows updated should be {expected_updated}, but got {res.rows_updated}"
     assert res.rows_inserted == expected_inserted, f"rows inserted should be {expected_inserted}, but got {res.rows_inserted}"
+
+
+def test_composite_equality_delete_upsert_15k_rows(catalog: InMemoryCatalog) -> None:
+    initial_count = 20_000
+    source_start = 10_000
+    source_end = 25_000
+    initial = pa.table(
+        {
+            "account_id": pa.array([row // 10 for row in range(initial_count)], type=pa.int64()),
+            "item_id": pa.array([row % 10 for row in range(initial_count)], type=pa.int64()),
+            "value": pa.array(range(initial_count), type=pa.int64()),
+        }
+    )
+    source = pa.table(
+        {
+            "account_id": pa.array([row // 10 for row in range(source_start, source_end)], type=pa.int64()),
+            "item_id": pa.array([row % 10 for row in range(source_start, source_end)], type=pa.int64()),
+            "value": pa.array([-row for row in range(source_start, source_end)], type=pa.int64()),
+        }
+    )
+
+    table = catalog.create_table("default.composite_equality_upsert", initial.schema)
+    table.append(initial)
+    table.upsert_by_equality_delete(source, join_cols=["account_id", "item_id"])
+
+    result = table.scan().to_arrow().sort_by([("account_id", "ascending"), ("item_id", "ascending")])
+    assert result.num_rows == source_end
+    values = result.column("value").to_pylist()
+    assert values[:source_start] == list(range(source_start))
+    assert values[source_start:] == [-row for row in range(source_start, source_end)]
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None
+    manifests = snapshot.manifests(table.io)
+    assert {manifest.content for manifest in manifests} == {ManifestContent.DATA, ManifestContent.DELETES}
+    delete_entries = [
+        entry
+        for manifest in manifests
+        if manifest.content == ManifestContent.DELETES
+        for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=True)
+    ]
+    assert len(delete_entries) == 1
+    assert delete_entries[0].data_file.content == DataFileContent.EQUALITY_DELETES
+    assert delete_entries[0].data_file.equality_ids == [1, 2]
+
+
+def test_equality_delete_upsert_is_metadata_atomic_on_commit_failure(
+    catalog: InMemoryCatalog, mocker: MockerFixture
+) -> None:
+    initial = pa.table({"id": pa.array([1, 2], type=pa.int64()), "value": ["one", "two"]})
+    source = pa.table({"id": pa.array([2, 3], type=pa.int64()), "value": ["updated", "three"]})
+    table = catalog.create_table(
+        "default.equality_atomic_failure",
+        initial.schema,
+        properties={TableProperties.COMMIT_NUM_RETRIES: "0"},
+    )
+    table.append(initial)
+    original_snapshot = table.current_snapshot()
+    assert original_snapshot is not None
+
+    mocker.patch.object(catalog, "commit_table", side_effect=CommitFailedException("forced failure"))
+    with pytest.raises(CommitFailedException, match="forced failure"):
+        table.upsert_by_equality_delete(source, join_cols=["id"])
+
+    table.refresh()
+    assert table.current_snapshot().snapshot_id == original_snapshot.snapshot_id  # type: ignore[union-attr]
+    assert table.scan().to_arrow().sort_by("id").to_pydict() == {"id": [1, 2], "value": ["one", "two"]}
+
+
+def test_equality_delete_upsert_survives_manifest_merging(catalog: InMemoryCatalog) -> None:
+    initial = pa.table({"id": pa.array([1, 2], type=pa.int64()), "value": ["one", "two"]})
+    table = catalog.create_table(
+        "default.equality_manifest_merge",
+        initial.schema,
+        properties={
+            TableProperties.MANIFEST_MERGE_ENABLED: "true",
+            TableProperties.MANIFEST_MIN_MERGE_COUNT: "1",
+            TableProperties.MANIFEST_TARGET_SIZE_BYTES: str(64 * 1024 * 1024),
+        },
+    )
+    table.append(initial)
+    table.upsert_by_equality_delete(
+        pa.table({"id": pa.array([2, 3], type=pa.int64()), "value": ["updated", "three"]}), join_cols=["id"]
+    )
+    table.append(pa.table({"id": pa.array([4], type=pa.int64()), "value": ["four"]}))
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None
+    assert {manifest.content for manifest in snapshot.manifests(table.io)} == {
+        ManifestContent.DATA,
+        ManifestContent.DELETES,
+    }
+    assert table.scan().to_arrow().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3, 4],
+        "value": ["one", "updated", "three", "four"],
+    }
+
+
+def test_empty_equality_delete_upsert_does_not_create_snapshot(catalog: InMemoryCatalog) -> None:
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("value", pa.string())])
+    table = catalog.create_table("default.empty_equality_upsert", schema)
+    table.upsert_by_equality_delete(schema.empty_table(), join_cols=["id"])
+    assert table.current_snapshot() is None
+
+
+def test_partitioned_equality_delete_upsert_requires_partition_source_in_key(catalog: InMemoryCatalog) -> None:
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "region", StringType(), required=True),
+        NestedField(3, "value", StringType(), required=False),
+    )
+    spec = PartitionSpec(PartitionField(2, 1000, IdentityTransform(), "region"))
+    table = catalog.create_table("default.partitioned_equality_upsert", schema, partition_spec=spec)
+    source = pa.table(
+        {"id": pa.array([1], type=pa.int32()), "region": ["west"], "value": ["one"]},
+        schema=schema_to_pyarrow(schema, include_field_ids=False),
+    )
+
+    with pytest.raises(ValueError, match="require every partition source column"):
+        table.upsert_by_equality_delete(source, join_cols=["id"])
+    assert table.current_snapshot() is None
 
 
 @pytest.mark.parametrize(

@@ -989,6 +989,100 @@ class Transaction:
 
         return UpsertResult(rows_updated=update_row_cnt, rows_inserted=insert_row_cnt)
 
+    def upsert_by_equality_delete(
+        self,
+        df: pa.Table,
+        join_cols: list[str] | None = None,
+        case_sensitive: bool = True,
+        branch: str | None = MAIN_BRANCH,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+    ) -> None:
+        """Atomically commit source-key deletes and replacement rows in one snapshot.
+
+        Snapshot visibility is atomic: readers see either the previous snapshot or
+        both the equality deletes and replacement data. Physical files are written
+        before the metadata commit, so a failed write or catalog commit can leave
+        unreferenced files for normal orphan-file maintenance.
+
+        Concurrent commits are ordered by their Iceberg snapshot sequence. A later
+        equality-delete commit can remove matching rows from an earlier concurrent
+        commit; rows committed later survive. Partitioned tables require every
+        partition source column in ``join_cols`` and currently reject evolved
+        partition specs because one partition-scoped delete cannot safely cover
+        data written under a different spec.
+        """
+        try:
+            import pyarrow as pa
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
+
+        from pyiceberg.io.pyarrow import (
+            _check_pyarrow_schema_compatible,
+            _dataframe_to_data_files,
+            _dataframe_to_equality_delete_files,
+        )
+        from pyiceberg.table import upsert_util
+
+        if not isinstance(df, pa.Table):
+            raise ValueError(f"Expected pa.Table, got: {df}")
+
+        if join_cols is None:
+            join_cols = []
+            for field_id in self.table_metadata.schema().identifier_field_ids:
+                column_name = self.table_metadata.schema().find_column_name(field_id)
+                if column_name is None:
+                    raise ValueError(f"Field ID could not be found: {field_id}")
+                join_cols.append(column_name)
+        if not join_cols:
+            raise ValueError("Join columns could not be found, please set identifier-field-ids or pass in explicitly.")
+        if upsert_util.has_duplicate_rows(df, join_cols):
+            raise ValueError("Duplicate rows found in source dataset based on the key columns. No upsert executed")
+
+        downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
+        _check_pyarrow_schema_compatible(
+            self.table_metadata.schema(),
+            provided_schema=df.schema,
+            downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+            format_version=self.table_metadata.format_version,
+        )
+        if df.num_rows == 0:
+            return
+        if not self.table_metadata.spec().is_unpartitioned() and len(self.table_metadata.specs()) > 1:
+            raise NotImplementedError("Equality-delete upserts do not yet support evolved partition specs")
+
+        equality_ids = [
+            self.table_metadata.schema().find_field(column_name, case_sensitive=case_sensitive).field_id
+            for column_name in join_cols
+        ]
+        commit_uuid = uuid.uuid4()
+        counter = itertools.count(0)
+        equality_delete_files = list(
+            _dataframe_to_equality_delete_files(
+                table_metadata=self.table_metadata,
+                df=df,
+                equality_ids=equality_ids,
+                io=self._table.io,
+                write_uuid=commit_uuid,
+                counter=counter,
+            )
+        )
+        data_files = list(
+            _dataframe_to_data_files(
+                table_metadata=self.table_metadata,
+                df=df,
+                io=self._table.io,
+                write_uuid=commit_uuid,
+                counter=counter,
+            )
+        )
+
+        with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).row_delta() as row_delta:
+            row_delta.commit_uuid = commit_uuid
+            for equality_delete_file in equality_delete_files:
+                row_delta.append_data_file(equality_delete_file)
+            for data_file in data_files:
+                row_delta.append_data_file(data_file)
+
     def _find_referenced_data_files(self, file_paths: list[str]) -> list[str]:
         """Return file_paths already referenced by data files in the current snapshot."""
         snapshot = self.table_metadata.current_snapshot()
@@ -1697,6 +1791,24 @@ class Table:
                 join_cols=join_cols,
                 when_matched_update_all=when_matched_update_all,
                 when_not_matched_insert_all=when_not_matched_insert_all,
+                case_sensitive=case_sensitive,
+                branch=branch,
+                snapshot_properties=snapshot_properties,
+            )
+
+    def upsert_by_equality_delete(
+        self,
+        df: pa.Table,
+        join_cols: list[str] | None = None,
+        case_sensitive: bool = True,
+        branch: str | None = MAIN_BRANCH,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+    ) -> None:
+        """Atomically commit equality deletes and replacement rows; see the transaction API for semantics."""
+        with self.transaction() as tx:
+            tx.upsert_by_equality_delete(
+                df=df,
+                join_cols=join_cols,
                 case_sensitive=case_sensitive,
                 branch=branch,
                 snapshot_properties=snapshot_properties,
@@ -2907,6 +3019,8 @@ class WriteTask:
     record_batches: list[pa.RecordBatch]
     sort_order_id: int | None = None
     partition_key: PartitionKey | None = None
+    content: DataFileContent = DataFileContent.DATA
+    equality_ids: tuple[int, ...] | None = None
 
     def generate_data_file_filename(self, extension: str) -> str:
         # Mimics the behavior in the Java API:

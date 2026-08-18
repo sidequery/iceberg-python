@@ -228,11 +228,19 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
 
     def _manifests(self) -> list[ManifestFile]:
         def _write_added_manifest() -> list[ManifestFile]:
-            if self._added_data_files:
+            files_by_content: dict[ManifestContent, list[DataFile]] = defaultdict(list)
+            for data_file in self._added_data_files:
+                manifest_content = (
+                    ManifestContent.DATA if data_file.content == DataFileContent.DATA else ManifestContent.DELETES
+                )
+                files_by_content[manifest_content].append(data_file)
+
+            manifests = []
+            for manifest_content, data_files in files_by_content.items():
                 with self.new_manifest_writer(
-                    spec=self._transaction.table_metadata.spec(),
+                    spec=self._transaction.table_metadata.spec(), content=manifest_content
                 ) as writer:
-                    for data_file in self._added_data_files:
+                    for data_file in data_files:
                         writer.add(
                             ManifestEntry.from_args(
                                 status=ManifestEntryStatus.ADDED,
@@ -242,9 +250,8 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
                                 data_file=data_file,
                             )
                         )
-                return [writer.to_manifest_file()]
-            else:
-                return []
+                manifests.append(writer.to_manifest_file())
+            return manifests
 
         def _write_delete_manifest() -> list[ManifestFile]:
             # Check if we need to mark the files as deleted
@@ -391,7 +398,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     def spec(self, spec_id: int) -> PartitionSpec:
         return self._transaction.table_metadata.specs()[spec_id]
 
-    def new_manifest_writer(self, spec: PartitionSpec) -> ManifestWriter:
+    def new_manifest_writer(
+        self, spec: PartitionSpec, content: ManifestContent = ManifestContent.DATA
+    ) -> ManifestWriter:
         return write_manifest(
             format_version=self._transaction.table_metadata.format_version,
             spec=spec,
@@ -399,6 +408,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             output_file=self.new_manifest_output(),
             snapshot_id=self._snapshot_id,
             avro_compression=self._compression,
+            content=content,
         )
 
     def new_manifest_output(self) -> OutputFile:
@@ -888,6 +898,18 @@ class UpdateSnapshot:
             snapshot_properties=self._snapshot_properties,
         )
 
+    def row_delta(self) -> _FastAppendFiles:
+        """Create a snapshot that atomically adds data and delete files."""
+        return _FastAppendFiles(
+            operation=Operation.OVERWRITE
+            if self._transaction.table_metadata.snapshot_by_name(name=self._branch) is not None
+            else Operation.APPEND,
+            transaction=self._transaction,
+            io=self._io,
+            branch=self._branch,
+            snapshot_properties=self._snapshot_properties,
+        )
+
     def overwrite(self, commit_uuid: uuid.UUID | None = None) -> _OverwriteFiles:
         return _OverwriteFiles(
             commit_uuid=commit_uuid,
@@ -924,14 +946,18 @@ class _ManifestMergeManager(Generic[U]):
         self._merge_enabled = merge_enabled
         self._snapshot_producer = snapshot_producer
 
-    def _group_by_spec(self, manifests: list[ManifestFile]) -> dict[int, list[ManifestFile]]:
+    def _group_by_spec_and_content(
+        self, manifests: list[ManifestFile]
+    ) -> dict[tuple[int, ManifestContent], list[ManifestFile]]:
         groups = defaultdict(list)
         for manifest in manifests:
-            groups[manifest.partition_spec_id].append(manifest)
+            groups[(manifest.partition_spec_id, manifest.content)].append(manifest)
         return groups
 
     def _create_manifest(self, spec_id: int, manifest_bin: list[ManifestFile]) -> ManifestFile:
-        with self._snapshot_producer.new_manifest_writer(spec=self._snapshot_producer.spec(spec_id)) as writer:
+        with self._snapshot_producer.new_manifest_writer(
+            spec=self._snapshot_producer.spec(spec_id), content=manifest_bin[0].content
+        ) as writer:
             for manifest in manifest_bin:
                 for entry in self._snapshot_producer.fetch_manifest_entry(manifest=manifest, discard_deleted=False):
                     if entry.status == ManifestEntryStatus.DELETED and entry.snapshot_id == self._snapshot_producer.snapshot_id:
@@ -974,12 +1000,12 @@ class _ManifestMergeManager(Generic[U]):
         if not self._merge_enabled or len(manifests) == 0:
             return manifests
 
-        first_manifest = manifests[0]
-        groups = self._group_by_spec(manifests)
+        groups = self._group_by_spec_and_content(manifests)
 
         merged_manifests = []
-        for spec_id in reversed(groups.keys()):
-            merged_manifests.extend(self._merge_group(first_manifest, spec_id, groups[spec_id]))
+        for spec_id, content in reversed(groups.keys()):
+            group = groups[(spec_id, content)]
+            merged_manifests.extend(self._merge_group(group[0], spec_id, group))
 
         return merged_manifests
 

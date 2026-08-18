@@ -2926,10 +2926,17 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
 
     def write_data_file(task: WriteTask) -> DataFile:
         table_schema = table_metadata.schema()
-        if (sanitized_schema := sanitize_column_names(table_schema)) != table_schema:
+        if task.content == DataFileContent.EQUALITY_DELETES:
+            if not task.equality_ids:
+                raise ValueError("Equality delete write task requires equality IDs")
+            requested_schema = prune_columns(table_schema, set(task.equality_ids), select_full_types=False)
+        else:
+            requested_schema = table_schema
+
+        if (sanitized_schema := sanitize_column_names(requested_schema)) != requested_schema:
             file_schema = sanitized_schema
         else:
-            file_schema = table_schema
+            file_schema = requested_schema
 
         downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         batches = [
@@ -2955,7 +2962,7 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
         statistics = writer.result()
 
         return DataFile.from_args(
-            content=DataFileContent.DATA,
+            content=task.content,
             file_path=file_path,
             file_format=file_format,
             partition=task.partition_key.partition if task.partition_key else Record(),
@@ -2966,7 +2973,7 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
             sort_order_id=None,
             # Just copy these from the table for now
             spec_id=table_metadata.default_spec_id,
-            equality_ids=None,
+            equality_ids=list(task.equality_ids) if task.equality_ids is not None else None,
             key_metadata=None,
             **statistics.to_serialized_dict(),
         )
@@ -3239,6 +3246,82 @@ def _dataframe_to_data_files(
                 for batches in bin_pack_arrow_table(partition.arrow_table_partition, target_file_size)
             ),
         )
+
+
+def _dataframe_to_equality_delete_files(
+    table_metadata: TableMetadata,
+    df: pa.Table,
+    equality_ids: list[int],
+    io: FileIO,
+    write_uuid: uuid.UUID | None = None,
+    counter: itertools.count[int] | None = None,
+) -> Iterable[DataFile]:
+    """Write equality delete files from rows containing the table's current columns."""
+    from pyiceberg.table import WriteTask
+
+    if table_metadata.format_version < 2:
+        raise ValueError("Equality deletes require an Iceberg table using format version 2 or later")
+    if not equality_ids:
+        raise ValueError("At least one equality field ID is required")
+
+    table_schema = table_metadata.schema()
+    missing_partition_sources = {
+        field.source_id for field in table_metadata.spec().fields if field.source_id not in equality_ids
+    }
+    if missing_partition_sources:
+        missing_names = sorted(table_schema.find_field(field_id).name for field_id in missing_partition_sources)
+        raise ValueError(
+            "Equality-delete upserts on partitioned tables require every partition source column in the equality keys; "
+            f"missing: {missing_names}"
+        )
+    equality_names = []
+    for field_id in equality_ids:
+        field_name = table_schema.find_column_name(field_id)
+        if field_name is None:
+            raise ValueError(f"Could not find equality field ID: {field_id}")
+        if "." in field_name:
+            raise NotImplementedError("Writing nested equality fields is not yet supported")
+        equality_names.append(field_name)
+
+    counter = counter or itertools.count(0)
+    write_uuid = write_uuid or uuid.uuid4()
+    target_file_size = property_as_int(
+        properties=table_metadata.properties,
+        property_name=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
+        default=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
+    )
+    name_mapping = table_schema.name_mapping
+
+    def write_partition(delete_rows: pa.Table, partition_key: PartitionKey | None) -> Iterable[DataFile]:
+        equality_rows = delete_rows.select(equality_names)
+        task_schema = pyarrow_to_schema(
+            equality_rows.schema,
+            name_mapping=name_mapping,
+            downcast_ns_timestamp_to_us=Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False,
+            format_version=table_metadata.format_version,
+        )
+        return write_file(
+            io=io,
+            table_metadata=table_metadata,
+            tasks=(
+                WriteTask(
+                    write_uuid=write_uuid,
+                    task_id=next(counter),
+                    record_batches=batches,
+                    schema=task_schema,
+                    partition_key=partition_key,
+                    content=DataFileContent.EQUALITY_DELETES,
+                    equality_ids=tuple(equality_ids),
+                )
+                for batches in bin_pack_arrow_table(equality_rows, target_file_size)
+            ),
+        )
+
+    if table_metadata.spec().is_unpartitioned():
+        yield from write_partition(df, None)
+    else:
+        for partition in _determine_partitions(spec=table_metadata.spec(), schema=table_schema, arrow_table=df):
+            yield from write_partition(partition.arrow_table_partition, partition.partition_key)
 
 
 @dataclass(frozen=True)
