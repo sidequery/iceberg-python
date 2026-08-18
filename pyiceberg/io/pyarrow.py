@@ -42,6 +42,8 @@ from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache, singledispatch
+from queue import Full, Queue
+from threading import Event
 from typing import (
     IO,
     TYPE_CHECKING,
@@ -2015,28 +2017,51 @@ class ArrowScan:
         total_row_count = 0
         executor = ExecutorFactory.get_or_create()
 
-        def batches_for_task(task: FileScanTask) -> list[pa.RecordBatch]:
-            # Materialize the iterator here to ensure execution happens within the executor.
-            # Otherwise, the iterator would be lazily consumed later (in the main thread),
-            # defeating the purpose of using executor.map.
-            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file))
+        done = object()
+        stopped = Event()
+        batch_queues: list[Queue[pa.RecordBatch | BaseException | object]] = [Queue(maxsize=1) for _ in planned_tasks]
 
-        limit_reached = False
-        for batches in executor.map(batches_for_task, planned_tasks):
-            for batch in batches:
-                current_batch_size = len(batch)
-                if self._limit is not None and total_row_count + current_batch_size >= self._limit:
-                    yield batch.slice(0, self._limit - total_row_count)
+        def put_unless_stopped(
+            queue: Queue[pa.RecordBatch | BaseException | object], item: pa.RecordBatch | BaseException | object
+        ) -> None:
+            while not stopped.is_set():
+                try:
+                    queue.put(item, timeout=0.1)
+                    return
+                except Full:
+                    continue
 
-                    limit_reached = True
-                    break
-                else:
+        def produce_batches(task: FileScanTask, queue: Queue[pa.RecordBatch | BaseException | object]) -> None:
+            try:
+                for batch in self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file):
+                    put_unless_stopped(queue, batch)
+                    if stopped.is_set():
+                        return
+            except BaseException as exc:
+                put_unless_stopped(queue, exc)
+            finally:
+                put_unless_stopped(queue, done)
+
+        futures = [executor.submit(produce_batches, task, queue) for task, queue in zip(planned_tasks, batch_queues, strict=True)]
+        try:
+            for queue in batch_queues:
+                while True:
+                    item = queue.get()
+                    if item is done:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    batch = item
+                    current_batch_size = len(batch)
+                    if self._limit is not None and total_row_count + current_batch_size >= self._limit:
+                        yield batch.slice(0, self._limit - total_row_count)
+                        return
                     yield batch
                     total_row_count += current_batch_size
-
-            if limit_reached:
-                # This break will also cancel all running tasks in the executor
-                break
+        finally:
+            stopped.set()
+            for future in futures:
+                future.cancel()
 
     def _record_batches_from_scan_tasks_and_deletes(
         self,

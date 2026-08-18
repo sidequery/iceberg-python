@@ -21,7 +21,7 @@ import sys
 import tempfile
 import uuid
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -2130,6 +2130,36 @@ def test_equality_deletes_are_applied_in_bounded_batches(tmp_path: str, monkeypa
     assert len(join_sizes) > 1
     assert max(data_rows for data_rows, _ in join_sizes) <= 3
     assert max(delete_rows for _, delete_rows in join_sizes) < len(delete_values)
+
+
+def test_record_batch_scan_yields_before_task_completion(
+    example_task: FileScanTask, table_schema_simple: Schema, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan = ArrowScan(
+        table_metadata=TableMetadataV2(
+            location="file://a/b/c.json",
+            last_column_id=3,
+            format_version=2,
+            current_schema_id=1,
+            schemas=[table_schema_simple],
+            partition_specs=[PartitionSpec()],
+        ),
+        io=load_file_io(),
+        projected_schema=table_schema_simple,
+        row_filter=AlwaysTrue(),
+    )
+    first_batch = pa.record_batch([pa.array([1], type=pa.int32())], names=["id"])
+
+    def task_batches(_tasks: Iterable[FileScanTask], _deletes: dict[str, list[pa.ChunkedArray]]) -> Iterator[pa.RecordBatch]:
+        yield first_batch
+        raise RuntimeError("after first batch")
+
+    monkeypatch.setattr(scan, "_record_batches_from_scan_tasks_and_deletes", task_batches)
+    batches = scan.to_record_batches([example_task])
+
+    assert next(batches) == first_batch
+    with pytest.raises(RuntimeError, match="after first batch"):
+        next(batches)
 
 
 def _scan_equality_task(schema: Schema, data_path: str, deletes_path: str, equality_ids: list[int]) -> pa.Table:
