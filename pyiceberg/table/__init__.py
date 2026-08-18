@@ -2255,19 +2255,13 @@ class FileScanTask(ScanTask):
         Returns:
             A FileScanTask with the converted data and delete files.
 
-        Raises:
-            NotImplementedError: If equality delete files are encountered.
         """
-        from pyiceberg.catalog.rest.scan_planning import RESTEqualityDeleteFile
-
         data_file = _rest_file_to_data_file(rest_task.data_file)
 
         resolved_deletes: set[DataFile] = set()
         if rest_task.delete_file_references:
             for idx in rest_task.delete_file_references:
                 delete_file = delete_files[idx]
-                if isinstance(delete_file, RESTEqualityDeleteFile):
-                    raise NotImplementedError(f"PyIceberg does not yet support equality deletes: {delete_file.file_path}")
                 resolved_deletes.add(_rest_file_to_data_file(delete_file))
 
         return FileScanTask(
@@ -2279,7 +2273,7 @@ class FileScanTask(ScanTask):
 
 def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
     """Convert a REST content file to a manifest DataFile."""
-    from pyiceberg.catalog.rest.scan_planning import RESTDataFile
+    from pyiceberg.catalog.rest.scan_planning import RESTDataFile, RESTEqualityDeleteFile
 
     if isinstance(rest_file, RESTDataFile):
         column_sizes = rest_file.column_sizes.to_dict() if rest_file.column_sizes else None
@@ -2291,6 +2285,8 @@ def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
         value_counts = None
         null_value_counts = None
         nan_value_counts = None
+
+    equality_ids = rest_file.equality_ids if isinstance(rest_file, RESTEqualityDeleteFile) else None
 
     data_file = DataFile.from_args(
         content=DataFileContent.from_rest_type(rest_file.content),
@@ -2305,6 +2301,7 @@ def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
         nan_value_counts=nan_value_counts,
         split_offsets=rest_file.split_offsets,
         sort_order_id=rest_file.sort_order_id,
+        equality_ids=equality_ids,
     )
     data_file.spec_id = rest_file.spec_id
     return data_file

@@ -74,6 +74,7 @@ from pyiceberg.io.pyarrow import (
     _check_pyarrow_schema_compatible,
     _ConvertToArrowSchema,
     _determine_partitions,
+    _null_safe_left_anti_join,
     _primitive_to_physical,
     _read_deletes,
     _task_to_record_batches,
@@ -117,6 +118,7 @@ from pyiceberg.types import (
     TimestampType,
     TimestamptzType,
     TimeType,
+    UUIDType,
 )
 from tests.catalog.test_base import InMemoryCatalog
 from tests.conftest import UNIFIED_AWS_SESSION_PROPERTIES
@@ -1912,6 +1914,235 @@ bar: [[1,3]]
 baz: [[true,null]]"""
 
     assert str(with_deletes) == expected_str
+
+
+def test_composite_equality_delete_with_nulls_and_hidden_projection(tmp_path: Path) -> None:
+    table_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "sub_id", StringType(), required=False),
+        NestedField(3, "payload", StringType(), required=False),
+        schema_id=1,
+    )
+    projected_schema = Schema(table_schema.find_field(3), schema_id=1)
+    equality_schema = Schema(table_schema.find_field(1), table_schema.find_field(2), schema_id=1)
+
+    data_path = str(tmp_path / "data.parquet")
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2, 3, 4], type=pa.int32()),
+                "sub_id": ["a", "b", None, None],
+                "payload": ["keep-a", "delete-b", "delete-null", "keep-null"],
+            },
+            schema=schema_to_pyarrow(table_schema),
+        ),
+        data_path,
+    )
+
+    delete_path = str(tmp_path / "eq-delete.parquet")
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([2, 3], type=pa.int32()),
+                "sub_id": ["b", None],
+            },
+            schema=schema_to_pyarrow(equality_schema),
+        ),
+        delete_path,
+    )
+
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=data_path,
+        file_format=FileFormat.PARQUET,
+        partition=Record(),
+        record_count=4,
+        file_size_in_bytes=Path(data_path).stat().st_size,
+    )
+    data_file.spec_id = 0
+    equality_delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=delete_path,
+        file_format=FileFormat.PARQUET,
+        partition=Record(),
+        record_count=2,
+        file_size_in_bytes=Path(delete_path).stat().st_size,
+        equality_ids=[1, 2],
+    )
+    equality_delete_file.spec_id = 0
+
+    result = ArrowScan(
+        table_metadata=TableMetadataV2(
+            location=str(tmp_path),
+            last_column_id=3,
+            format_version=2,
+            current_schema_id=1,
+            schemas=[table_schema],
+            partition_specs=[PartitionSpec()],
+        ),
+        io=PyArrowFileIO(),
+        projected_schema=projected_schema,
+        row_filter=AlwaysTrue(),
+    ).to_table(tasks=[FileScanTask(data_file=data_file, delete_files={equality_delete_file})])
+
+    assert result.to_pydict() == {"payload": ["keep-a", "keep-null"]}
+
+
+def _scan_equality_delete_files(
+    schema: Schema,
+    data_path: Path,
+    delete_paths: list[Path],
+    equality_ids: list[int],
+    file_format: FileFormat = FileFormat.PARQUET,
+) -> pa.Table:
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=str(data_path),
+        file_format=file_format,
+        partition=Record(),
+        record_count=1,
+        file_size_in_bytes=data_path.stat().st_size,
+    )
+    data_file.spec_id = 0
+    delete_files = {
+        DataFile.from_args(
+            content=DataFileContent.EQUALITY_DELETES,
+            file_path=str(delete_path),
+            file_format=file_format,
+            partition=Record(),
+            record_count=1,
+            file_size_in_bytes=delete_path.stat().st_size,
+            equality_ids=equality_ids,
+        )
+        for delete_path in delete_paths
+    }
+    return ArrowScan(
+        table_metadata=TableMetadataV2(
+            location=str(data_path.parent),
+            last_column_id=max(schema.field_ids),
+            format_version=2,
+            current_schema_id=schema.schema_id,
+            schemas=[schema],
+            partition_specs=[PartitionSpec()],
+        ),
+        io=PyArrowFileIO(),
+        projected_schema=schema,
+        row_filter=AlwaysTrue(),
+    ).to_table(tasks=(task for task in [FileScanTask(data_file=data_file, delete_files=delete_files)]))
+
+
+def test_equality_delete_treats_nan_as_equal(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "value", FloatType(), required=False), schema_id=1)
+    data_path = tmp_path / "data.parquet"
+    delete_path = tmp_path / "delete.parquet"
+    pq.write_table(
+        pa.table({"value": pa.array([1.0, float("nan")], type=pa.float32())}, schema=schema_to_pyarrow(schema)),
+        data_path,
+    )
+    pq.write_table(pa.table({"value": pa.array([float("nan")], type=pa.float32())}), delete_path)
+
+    result = _scan_equality_delete_files(schema, data_path, [delete_path], [1])
+    assert result.column("value").to_pylist() == [1.0]
+
+
+def test_equality_delete_treats_uuid_nulls_as_equal(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "id", UUIDType(), required=False), schema_id=1)
+    data_path = tmp_path / "data.parquet"
+    delete_path = tmp_path / "delete.parquet"
+    kept = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    pq.write_table(
+        pa.table({"id": pa.array([kept, None], type=pa.uuid())}, schema=schema_to_pyarrow(schema)), data_path
+    )
+    pq.write_table(pa.table({"id": pa.array([None], type=pa.uuid())}), delete_path)
+
+    result = _scan_equality_delete_files(schema, data_path, [delete_path], [1])
+    assert result.column("id").to_pylist() == [kept]
+
+
+def test_equality_delete_aligns_renamed_fields_by_id(tmp_path: Path) -> None:
+    current_schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=1)
+    renamed_schema = Schema(NestedField(1, "old_id", IntegerType(), required=True), schema_id=1)
+    data_path = tmp_path / "data.parquet"
+    current_delete_path = tmp_path / "current-delete.parquet"
+    renamed_delete_path = tmp_path / "renamed-delete.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array([1, 2, 3], type=pa.int32())}, schema=schema_to_pyarrow(current_schema)), data_path
+    )
+    pq.write_table(
+        pa.table({"id": pa.array([2], type=pa.int32())}, schema=schema_to_pyarrow(current_schema)),
+        current_delete_path,
+    )
+    pq.write_table(
+        pa.table({"old_id": pa.array([3], type=pa.int32())}, schema=schema_to_pyarrow(renamed_schema)),
+        renamed_delete_path,
+    )
+
+    result = _scan_equality_delete_files(
+        current_schema, data_path, [current_delete_path, renamed_delete_path], [1]
+    )
+    assert result.column("id").to_pylist() == [1]
+
+
+def test_equality_delete_dropped_field_does_not_match_a_partial_key(tmp_path: Path) -> None:
+    current_schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=1)
+    delete_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "dropped", StringType(), required=False),
+        schema_id=1,
+    )
+    data_path = tmp_path / "data.parquet"
+    delete_path = tmp_path / "delete.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array([1], type=pa.int32())}, schema=schema_to_pyarrow(current_schema)), data_path
+    )
+    pq.write_table(
+        pa.table(
+            {"id": pa.array([1], type=pa.int32()), "dropped": ["not-null"]},
+            schema=schema_to_pyarrow(delete_schema),
+        ),
+        delete_path,
+    )
+
+    result = _scan_equality_delete_files(current_schema, data_path, [delete_path], [1, 2])
+    assert result.column("id").to_pylist() == [1]
+
+
+def test_orc_equality_delete(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=1)
+    data_path = tmp_path / "data.orc"
+    delete_path = tmp_path / "delete.orc"
+    orc.write_table(
+        pa.table({"id": pa.array([1, 2, 3], type=pa.int32())}, schema=schema_to_pyarrow(schema)), data_path
+    )
+    orc.write_table(pa.table({"id": pa.array([2], type=pa.int32())}, schema=schema_to_pyarrow(schema)), delete_path)
+
+    result = _scan_equality_delete_files(schema, data_path, [delete_path], [1], FileFormat.ORC)
+    assert result.column("id").to_pylist() == [1, 3]
+
+
+def test_equality_delete_casts_promoted_key_types(tmp_path: Path) -> None:
+    current_schema = Schema(NestedField(1, "id", LongType(), required=True), schema_id=1)
+    old_schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=1)
+    data_path = tmp_path / "data.parquet"
+    delete_path = tmp_path / "delete.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array([1, 2, 3], type=pa.int64())}, schema=schema_to_pyarrow(current_schema)), data_path
+    )
+    pq.write_table(
+        pa.table({"id": pa.array([2], type=pa.int32())}, schema=schema_to_pyarrow(old_schema)), delete_path
+    )
+
+    result = _scan_equality_delete_files(current_schema, data_path, [delete_path], [1])
+    assert result.column("id").to_pylist() == [1, 3]
+
+
+def test_equality_delete_temporary_columns_do_not_collide() -> None:
+    helper_like_name = "__pyiceberg_equality_null_0"
+    data = pa.table({"id": [1, None, 3], helper_like_name: ["a", "b", "c"]})
+    deletes = pa.table({"id": pa.array([None], type=pa.int64())})
+
+    result = _null_safe_left_anti_join(data, deletes, ["id"])
+    assert result.to_pydict() == {"id": [1, 3], helper_like_name: ["a", "c"]}
 
 
 def test_pyarrow_wrap_fsspec(example_task: FileScanTask, table_schema_simple: Schema) -> None:

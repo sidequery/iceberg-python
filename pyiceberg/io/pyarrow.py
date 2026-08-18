@@ -1157,6 +1157,165 @@ def _read_deletes(io: FileIO, data_file: DataFile) -> dict[str, pa.ChunkedArray]
         raise ValueError(f"Delete file format not supported: {data_file.file_format}")
 
 
+def _read_equality_deletes(io: FileIO, delete_file: DataFile) -> pa.Table:
+    """Read an equality delete file while preserving its field-ID metadata."""
+    if delete_file.file_format not in (FileFormat.PARQUET, FileFormat.ORC):
+        raise ValueError(f"Equality delete file format not supported: {delete_file.file_format}")
+    if not delete_file.equality_ids:
+        raise ValueError(f"Equality delete file has no equality IDs: {delete_file.file_path}")
+
+    with io.new_input(delete_file.file_path).open() as fin:
+        fragment = _get_file_format(delete_file.file_format, pre_buffer=True, buffer_size=ONE_MEGABYTE).make_fragment(fin)
+        physical_schema = fragment.physical_schema
+        equality_ids = set(delete_file.equality_ids)
+        projected_columns = [field.name for field in physical_schema if _get_field_id(field) in equality_ids]
+        # Older writers may not retain field IDs in the physical schema. Reading
+        # all columns is the conservative fallback; alignment below still rejects
+        # a file that cannot supply every declared equality field.
+        columns = projected_columns if len(projected_columns) == len(equality_ids) else None
+        # Delete files are already read concurrently by PyIceberg's executor;
+        # disable nested Arrow threading to avoid oversubscription per file.
+        return ds.Scanner.from_fragment(
+            fragment=fragment, schema=physical_schema, columns=columns, use_threads=False
+        ).to_table()
+
+
+def _column_name_for_field_id(table: pa.Table, field_id: int, schema: Schema) -> str | None:
+    try:
+        current_name = schema.find_field(field_id).name
+    except ValueError:
+        current_name = None
+    if current_name is not None and current_name in table.column_names:
+        return current_name
+    for field in table.schema:
+        if _get_field_id(field) == field_id:
+            return field.name
+    return None
+
+
+def _align_equality_delete_table(
+    data: pa.Table, deletes: pa.Table, equality_ids: Iterable[int], table_schema: Schema
+) -> tuple[pa.Table, pa.Table, list[str]]:
+    """Align equality keys by stable field ID across rename, drop, and promotion."""
+    join_keys: list[str] = []
+    for field_id in equality_ids:
+        data_name = _column_name_for_field_id(data, field_id, table_schema)
+        delete_name = _column_name_for_field_id(deletes, field_id, table_schema)
+        if delete_name is None:
+            raise ValueError(f"Equality delete file is missing field ID {field_id}")
+
+        if data_name is None:
+            # A field absent from this data file is projected as null under Iceberg
+            # schema evolution rules. It may therefore match a null delete key.
+            data = data.append_column(delete_name, pa.nulls(data.num_rows, type=deletes.schema.field(delete_name).type))
+            data_name = delete_name
+        if delete_name != data_name:
+            names = list(deletes.column_names)
+            names[names.index(delete_name)] = data_name
+            deletes = deletes.rename_columns(names)
+
+        data_type = data.schema.field(data_name).type
+        if deletes.schema.field(data_name).type != data_type:
+            deletes = deletes.set_column(
+                deletes.schema.get_field_index(data_name), data_name, pc.cast(deletes[data_name], data_type)
+            )
+        join_keys.append(data_name)
+
+    return data, deletes, join_keys
+
+
+def _fill_null_value(data_type: pa.DataType) -> Any:
+    if pa.types.is_integer(data_type) or pa.types.is_floating(data_type) or pa.types.is_decimal(data_type):
+        return 0
+    if pa.types.is_boolean(data_type):
+        return False
+    if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
+        return ""
+    if pa.types.is_binary(data_type) or pa.types.is_large_binary(data_type):
+        return b""
+    if pa.types.is_fixed_size_binary(data_type):
+        return b"\x00" * data_type.byte_width
+    if isinstance(data_type, pa.UuidType):
+        return pa.scalar(b"\x00" * 16, type=data_type)
+    if pa.types.is_timestamp(data_type) or pa.types.is_date(data_type) or pa.types.is_time(data_type):
+        return pa.scalar(0, type=data_type)
+    if storage_type := getattr(data_type, "storage_type", None):
+        return _fill_null_value(storage_type)
+    raise TypeError(f"Unsupported equality field type: {data_type}")
+
+
+def _null_safe_left_anti_join(data: pa.Table, deletes: pa.Table, keys: list[str]) -> pa.Table:
+    """Return data rows without an Iceberg null/NaN-safe typed key match."""
+    if data.num_rows == 0 or deletes.num_rows == 0:
+        return data
+
+    data_join = data
+    delete_join = deletes.select(keys)
+    join_columns: list[str] = []
+    temporary_columns: list[str] = []
+    temporary_index = 0
+
+    def temporary_name(kind: str) -> str:
+        nonlocal temporary_index
+        while True:
+            name = f"__pyiceberg_equality_{kind}_{temporary_index}"
+            temporary_index += 1
+            if name not in data_join.column_names and name not in delete_join.column_names:
+                return name
+
+    for key in keys:
+        key_type = data_join.schema.field(key).type
+        data_values = data_join[key]
+        delete_values = delete_join[key]
+        if storage_type := getattr(key_type, "storage_type", None):
+            data_values = data_values.cast(storage_type)
+            delete_values = delete_values.cast(storage_type)
+            fill_type = storage_type
+        else:
+            fill_type = key_type
+
+        null_key = temporary_name("null")
+        value_key = temporary_name("value")
+        fill_value = _fill_null_value(fill_type)
+        data_join = data_join.append_column(null_key, pc.is_null(data_values))
+        delete_join = delete_join.append_column(null_key, pc.is_null(delete_values))
+        data_join = data_join.append_column(value_key, pc.fill_null(data_values, fill_value))
+        delete_join = delete_join.append_column(value_key, pc.fill_null(delete_values, fill_value))
+        join_columns.extend((null_key, value_key))
+        temporary_columns.extend((null_key, value_key))
+
+        if pa.types.is_floating(key_type):
+            nan_key = temporary_name("nan")
+            data_join = data_join.append_column(nan_key, pc.fill_null(pc.is_nan(data_join[key]), False))
+            delete_join = delete_join.append_column(nan_key, pc.fill_null(pc.is_nan(delete_join[key]), False))
+            join_columns.append(nan_key)
+            temporary_columns.append(nan_key)
+
+    joined = data_join.join(
+        delete_join.select(join_columns), keys=join_columns, join_type="left anti", use_threads=False
+    )
+    return joined.drop(temporary_columns)
+
+
+def _apply_equality_deletes(
+    data: pa.Table, equality_groups: dict[frozenset[int], list[pa.Table]], table_schema: Schema
+) -> pa.Table:
+    """Apply each distinct equality-key layout once to a record batch."""
+    for equality_ids, delete_tables in equality_groups.items():
+        aligned_deletes: list[pa.Table] = []
+        join_keys: list[str] | None = None
+        for delete_table in delete_tables:
+            data, aligned, keys = _align_equality_delete_table(data, delete_table, equality_ids, table_schema)
+            join_keys = join_keys or keys
+            aligned_deletes.append(aligned.select(keys))
+        if aligned_deletes:
+            deletes = pa.concat_tables(aligned_deletes, promote_options="permissive")
+            data = _null_safe_left_anti_join(data, deletes, join_keys or [])
+            if data.num_rows == 0:
+                break
+    return data
+
+
 def _combine_positional_deletes(positional_deletes: list[pa.ChunkedArray], start_index: int, end_index: int) -> pa.Array:
     if len(positional_deletes) == 1:
         all_chunks = positional_deletes[0]
@@ -1640,6 +1799,7 @@ def _task_to_record_batches(
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
     downcast_ns_timestamp_to_us: bool | None = None,
     dictionary_columns: tuple[str, ...] = (),
+    equality_delete_tables: dict[DataFile, pa.Table] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     format_kwargs: dict[str, Any] = {"pre_buffer": True, "buffer_size": ONE_MEGABYTE * 8}
     if dictionary_columns and task.file.file_format == FileFormat.PARQUET:
@@ -1672,14 +1832,25 @@ def _task_to_record_batches(
             bound_file_filter = bind(file_schema, translated_row_filter, case_sensitive=case_sensitive)
             pyarrow_filter = expression_to_pyarrow(bound_file_filter, file_schema)
 
-        file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
+        equality_groups: dict[frozenset[int], list[pa.Table]] = {}
+        equality_field_ids: set[int] = set()
+        if equality_delete_tables:
+            for delete_file in task.delete_files:
+                if delete_file.content != DataFileContent.EQUALITY_DELETES:
+                    continue
+                equality_table = equality_delete_tables.get(delete_file)
+                if equality_table is not None:
+                    equality_ids = frozenset(delete_file.equality_ids or ())
+                    equality_field_ids.update(equality_ids)
+                    equality_groups.setdefault(equality_ids, []).append(equality_table)
+        file_project_schema = prune_columns(file_schema, projected_field_ids.union(equality_field_ids), select_full_types=False)
 
         fragment_scanner = ds.Scanner.from_fragment(
             fragment=fragment,
             schema=physical_schema,
             # This will push down the query to Arrow.
             # But in case there are positional deletes, we have to apply them first
-            filter=pyarrow_filter if not positional_deletes else None,
+            filter=pyarrow_filter if not positional_deletes and not equality_groups else None,
             columns=[col.name for col in file_project_schema.columns],
         )
 
@@ -1694,16 +1865,18 @@ def _task_to_record_batches(
                 # Create the mask of indices that we're interested in
                 indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
                 current_batch = current_batch.take(indices)
-                if pyarrow_filter is not None:
-                    # Temporary fix until PyArrow 21 is the minimum supported version
-                    # (https://github.com/apache/arrow/pull/46057): RecordBatch.filter raises
-                    # IndexError on PyArrow <21 when the result is empty; Table.filter does not.
-                    table = pa.Table.from_batches([current_batch])
-                    table = table.filter(pyarrow_filter)
-                    if table.num_rows == 0:
-                        current_batch = current_batch.slice(0, 0)
-                    else:
-                        current_batch = table.combine_chunks().to_batches()[0]
+
+            if equality_groups and current_batch.num_rows > 0:
+                table = pa.Table.from_batches([current_batch])
+                table = _apply_equality_deletes(table, equality_groups, table_schema)
+                current_batch = table.combine_chunks().to_batches()[0] if table.num_rows > 0 else current_batch.slice(0, 0)
+
+            if (positional_deletes or equality_groups) and pyarrow_filter is not None and current_batch.num_rows > 0:
+                # Temporary fix until PyArrow 21 is the minimum supported version
+                # (https://github.com/apache/arrow/pull/46057): RecordBatch.filter raises
+                # IndexError on PyArrow <21 when the result is empty; Table.filter does not.
+                table = pa.Table.from_batches([current_batch]).filter(pyarrow_filter)
+                current_batch = table.combine_chunks().to_batches()[0] if table.num_rows > 0 else current_batch.slice(0, 0)
 
             # skip empty batches
             if current_batch.num_rows == 0:
@@ -1721,7 +1894,11 @@ def _task_to_record_batches(
 
 def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[str, list[ChunkedArray]]:
     deletes_per_file: dict[str, list[ChunkedArray]] = {}
-    unique_deletes = set(itertools.chain.from_iterable([task.delete_files for task in tasks]))
+    unique_deletes = {
+        delete_file
+        for delete_file in itertools.chain.from_iterable(task.delete_files for task in tasks)
+        if delete_file.content == DataFileContent.POSITION_DELETES
+    }
     if len(unique_deletes) > 0:
         executor = ExecutorFactory.get_or_create()
         deletes_per_files: Iterator[dict[str, ChunkedArray]] = executor.map(
@@ -1736,6 +1913,20 @@ def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[st
                     deletes_per_file[file] = [arr]
 
     return deletes_per_file
+
+
+def _read_all_equality_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[DataFile, pa.Table]:
+    equality_delete_files = {
+        delete_file
+        for delete_file in itertools.chain.from_iterable(task.delete_files for task in tasks)
+        if delete_file.content == DataFileContent.EQUALITY_DELETES
+    }
+    if not equality_delete_files:
+        return {}
+
+    executor = ExecutorFactory.get_or_create()
+    results = executor.map(lambda delete_file: _read_equality_deletes(io, delete_file), equality_delete_files)
+    return dict(zip(equality_delete_files, results, strict=True))
 
 
 class ArrowScan:
@@ -1841,7 +2032,9 @@ class ArrowScan:
             ResolveError: When a required field cannot be found in the file
             ValueError: When a field type in the file cannot be projected to the schema type
         """
-        deletes_per_file = _read_all_delete_files(self._io, tasks)
+        planned_tasks = list(tasks)
+        deletes_per_file = _read_all_delete_files(self._io, planned_tasks)
+        equality_deletes = _read_all_equality_delete_files(self._io, planned_tasks)
 
         total_row_count = 0
         executor = ExecutorFactory.get_or_create()
@@ -1850,10 +2043,10 @@ class ArrowScan:
             # Materialize the iterator here to ensure execution happens within the executor.
             # Otherwise, the iterator would be lazily consumed later (in the main thread),
             # defeating the purpose of using executor.map.
-            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file))
+            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file, equality_deletes))
 
         limit_reached = False
-        for batches in executor.map(batches_for_task, tasks):
+        for batches in executor.map(batches_for_task, planned_tasks):
             for batch in batches:
                 current_batch_size = len(batch)
                 if self._limit is not None and total_row_count + current_batch_size >= self._limit:
@@ -1870,7 +2063,10 @@ class ArrowScan:
                 break
 
     def _record_batches_from_scan_tasks_and_deletes(
-        self, tasks: Iterable[FileScanTask], deletes_per_file: dict[str, list[ChunkedArray]]
+        self,
+        tasks: Iterable[FileScanTask],
+        deletes_per_file: dict[str, list[ChunkedArray]],
+        equality_deletes: dict[DataFile, pa.Table] | None = None,
     ) -> Iterator[pa.RecordBatch]:
         total_row_count = 0
         for task in tasks:
@@ -1890,6 +2086,7 @@ class ArrowScan:
                 self._table_metadata.format_version,
                 self._downcast_ns_timestamp_to_us,
                 self._dictionary_columns,
+                equality_deletes,
             )
             for batch in batches:
                 if self._limit is not None:
