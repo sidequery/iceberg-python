@@ -2804,7 +2804,7 @@ class ManifestGroupPlanner:
             List of FileScanTasks that contain both data and delete files.
         """
         data_entries: list[ManifestEntry] = []
-        delete_index = DeleteFileIndex()
+        delete_index = DeleteFileIndex(self.table_metadata.schema())
 
         residual_evaluators: dict[int, Callable[[DataFile], ResidualEvaluator]] = KeyDefaultDict(self._build_residual_evaluator)
 
@@ -2815,10 +2815,8 @@ class ManifestGroupPlanner:
             data_file = manifest_entry.data_file
             if data_file.content == DataFileContent.DATA:
                 data_entries.append(manifest_entry)
-            elif data_file.content == DataFileContent.POSITION_DELETES:
+            elif data_file.content in (DataFileContent.POSITION_DELETES, DataFileContent.EQUALITY_DELETES):
                 delete_index.add_delete_file(manifest_entry, partition_key=data_file.partition)
-            elif data_file.content == DataFileContent.EQUALITY_DELETES:
-                raise ValueError("PyIceberg does not yet support equality deletes: https://github.com/apache/iceberg/issues/6568")
             else:
                 raise ValueError(f"Unknown DataFileContent ({data_file.content}): {manifest_entry}")
 

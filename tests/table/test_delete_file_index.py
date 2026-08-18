@@ -16,12 +16,22 @@
 # under the License.
 import pytest
 
+from pyiceberg.conversions import to_bytes
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestEntry, ManifestEntryStatus
+from pyiceberg.schema import Schema
 from pyiceberg.table.delete_file_index import PATH_FIELD_ID, DeleteFileIndex, PositionDeletes
 from pyiceberg.typedef import Record
+from pyiceberg.types import IntegerType, LongType, NestedField, StringType
 
 
-def _create_data_file(file_path: str = "s3://bucket/data.parquet", spec_id: int = 0) -> DataFile:
+def _create_data_file(
+    file_path: str = "s3://bucket/data.parquet",
+    spec_id: int = 0,
+    lower_bounds: dict[int, bytes] | None = None,
+    upper_bounds: dict[int, bytes] | None = None,
+    null_value_counts: dict[int, int] | None = None,
+    value_counts: dict[int, int] | None = None,
+) -> DataFile:
     data_file = DataFile.from_args(
         content=DataFileContent.DATA,
         file_path=file_path,
@@ -29,6 +39,10 @@ def _create_data_file(file_path: str = "s3://bucket/data.parquet", spec_id: int 
         partition=Record(),
         record_count=100,
         file_size_in_bytes=1000,
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        null_value_counts=null_value_counts,
+        value_counts=value_counts,
     )
     data_file._spec_id = spec_id
     return data_file
@@ -46,6 +60,33 @@ def _create_positional_delete(
         file_size_in_bytes=100,
         lower_bounds={PATH_FIELD_ID: file_path.encode()},
         upper_bounds={PATH_FIELD_ID: file_path.encode()},
+    )
+    delete_file._spec_id = spec_id
+    return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
+
+
+def _create_equality_delete(
+    sequence_number: int = 1,
+    spec_id: int = 0,
+    partition: Record | None = None,
+    equality_ids: list[int] | None = None,
+    lower_bounds: dict[int, bytes] | None = None,
+    upper_bounds: dict[int, bytes] | None = None,
+    null_value_counts: dict[int, int] | None = None,
+    value_counts: dict[int, int] | None = None,
+) -> ManifestEntry:
+    delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=f"s3://bucket/eq-delete-{sequence_number}.parquet",
+        file_format=FileFormat.PARQUET,
+        partition=partition or Record(),
+        record_count=10,
+        file_size_in_bytes=100,
+        equality_ids=equality_ids or [1, 2],
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        null_value_counts=null_value_counts,
+        value_counts=value_counts,
     )
     delete_file._spec_id = spec_id
     return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
@@ -101,6 +142,20 @@ def test_sequence_number_filtering() -> None:
     assert len(index.for_data_file(3, data_file)) == 2
     assert len(index.for_data_file(5, data_file)) == 1
     assert len(index.for_data_file(7, data_file)) == 0
+
+
+def test_equality_delete_sequence_number_is_strictly_greater() -> None:
+    index = DeleteFileIndex()
+
+    index.add_delete_file(_create_equality_delete(sequence_number=2))
+    index.add_delete_file(_create_equality_delete(sequence_number=4))
+
+    data_file = _create_data_file()
+
+    assert len(index.for_data_file(1, data_file)) == 2
+    assert len(index.for_data_file(2, data_file)) == 1
+    assert len(index.for_data_file(3, data_file)) == 1
+    assert len(index.for_data_file(4, data_file)) == 0
 
 
 def test_path_specific_deletes() -> None:
@@ -187,3 +242,138 @@ def test_record_equality_for_partition_lookup() -> None:
 
     assert len(index.for_data_file(1, data_file, partition_b)) == 1
     assert len(index.for_data_file(1, data_file, partition_c)) == 0
+
+
+def test_equality_delete_sequence_number_filtering() -> None:
+    index = DeleteFileIndex()
+    equality_delete = _create_equality_delete(sequence_number=2)
+    index.add_delete_file(equality_delete)
+
+    data_file = _create_data_file()
+    assert equality_delete.data_file in index.for_data_file(1, data_file)
+    assert equality_delete.data_file not in index.for_data_file(2, data_file)
+    assert equality_delete.data_file not in index.for_data_file(3, data_file)
+
+
+def test_equality_and_position_delete_sequence_semantics_differ() -> None:
+    data_file = _create_data_file()
+    position_delete = _create_positional_delete(sequence_number=10)
+    equality_delete = _create_equality_delete(sequence_number=10)
+    index = DeleteFileIndex()
+    index.add_delete_file(position_delete)
+    index.add_delete_file(equality_delete)
+
+    assert index.for_data_file(10, data_file) == {position_delete.data_file}
+    assert index.for_data_file(9, data_file) == {position_delete.data_file, equality_delete.data_file}
+    assert index.for_data_file(11, data_file) == set()
+
+
+def test_global_equality_deletes_apply_to_partitioned_data() -> None:
+    index = DeleteFileIndex()
+    global_delete = _create_equality_delete(sequence_number=10)
+    partition_delete = _create_equality_delete(sequence_number=20)
+    partition_a = Record(1)
+    partition_b = Record(2)
+    index.add_delete_file(global_delete)
+    index.add_delete_file(partition_delete, partition_a)
+
+    data_file = _create_data_file()
+    assert index.for_data_file(1, data_file, partition_a) == {global_delete.data_file, partition_delete.data_file}
+    assert index.for_data_file(1, data_file, partition_b) == {global_delete.data_file}
+
+
+def test_equality_delete_metrics_filtering() -> None:
+    index = DeleteFileIndex(Schema(NestedField(1, "id", IntegerType(), required=True)))
+    equality_delete = _create_equality_delete(
+        sequence_number=100,
+        equality_ids=[1],
+        lower_bounds={1: to_bytes(IntegerType(), 10)},
+        upper_bounds={1: to_bytes(IntegerType(), 20)},
+    )
+    index.add_delete_file(equality_delete)
+
+    before = _create_data_file(
+        lower_bounds={1: to_bytes(IntegerType(), 0)}, upper_bounds={1: to_bytes(IntegerType(), 5)}
+    )
+    overlap = _create_data_file(
+        lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)}
+    )
+    after = _create_data_file(
+        lower_bounds={1: to_bytes(IntegerType(), 25)}, upper_bounds={1: to_bytes(IntegerType(), 30)}
+    )
+    assert index.for_data_file(1, before) == set()
+    assert index.for_data_file(1, overlap) == {equality_delete.data_file}
+    assert index.for_data_file(1, after) == set()
+
+
+@pytest.mark.parametrize(
+    ("delete_nulls", "data_nulls"),
+    [((10, 10), (0, 100)), ((0, 10), (100, 100))],
+)
+def test_equality_delete_prunes_disjoint_null_populations(
+    delete_nulls: tuple[int, int], data_nulls: tuple[int, int]
+) -> None:
+    index = DeleteFileIndex(Schema(NestedField(1, "id", IntegerType(), required=False)))
+    equality_delete = _create_equality_delete(
+        sequence_number=10,
+        equality_ids=[1],
+        null_value_counts={1: delete_nulls[0]},
+        value_counts={1: delete_nulls[1]},
+    )
+    index.add_delete_file(equality_delete)
+    data_file = _create_data_file(null_value_counts={1: data_nulls[0]}, value_counts={1: data_nulls[1]})
+    assert index.for_data_file(1, data_file) == set()
+
+
+def test_equality_delete_metrics_after_int_to_long_promotion() -> None:
+    index = DeleteFileIndex(Schema(NestedField(1, "id", LongType(), required=True)))
+    equality_delete = _create_equality_delete(
+        sequence_number=100,
+        equality_ids=[1],
+        lower_bounds={1: to_bytes(IntegerType(), 10)},
+        upper_bounds={1: to_bytes(IntegerType(), 20)},
+    )
+    index.add_delete_file(equality_delete)
+    before = _create_data_file(
+        lower_bounds={1: to_bytes(IntegerType(), 0)}, upper_bounds={1: to_bytes(IntegerType(), 5)}
+    )
+    overlap = _create_data_file(
+        lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)}
+    )
+    assert index.for_data_file(1, before) == set()
+    assert index.for_data_file(1, overlap) == {equality_delete.data_file}
+
+
+def test_equality_delete_dropped_field_is_not_pruned() -> None:
+    index = DeleteFileIndex(Schema(NestedField(2, "other", StringType(), required=True)))
+    equality_delete = _create_equality_delete(
+        sequence_number=10,
+        equality_ids=[1],
+        lower_bounds={1: to_bytes(IntegerType(), 10)},
+        upper_bounds={1: to_bytes(IntegerType(), 20)},
+    )
+    index.add_delete_file(equality_delete)
+    data_file = _create_data_file(
+        lower_bounds={1: to_bytes(IntegerType(), 15)}, upper_bounds={1: to_bytes(IntegerType(), 25)}
+    )
+    assert index.for_data_file(1, data_file) == {equality_delete.data_file}
+
+
+def test_equality_delete_is_not_pruned_when_both_files_contain_nulls() -> None:
+    index = DeleteFileIndex(Schema(NestedField(1, "id", IntegerType(), required=False)))
+    equality_delete = _create_equality_delete(
+        sequence_number=100,
+        equality_ids=[1],
+        lower_bounds={1: to_bytes(IntegerType(), 10)},
+        upper_bounds={1: to_bytes(IntegerType(), 20)},
+        null_value_counts={1: 1},
+        value_counts={1: 10},
+    )
+    index.add_delete_file(equality_delete)
+    data_file = _create_data_file(
+        lower_bounds={1: to_bytes(IntegerType(), 0)},
+        upper_bounds={1: to_bytes(IntegerType(), 5)},
+        null_value_counts={1: 1},
+        value_counts={1: 100},
+    )
+    assert index.for_data_file(1, data_file) == {equality_delete.data_file}
