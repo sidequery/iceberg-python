@@ -28,6 +28,7 @@ from pyiceberg.avro.codecs import AvroCompressionCodec
 from pyiceberg.io import load_file_io
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.manifest import (
+    DATA_FILE_TYPE,
     DataFile,
     DataFileContent,
     FileFormat,
@@ -47,12 +48,19 @@ from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table.snapshots import Operation, Snapshot, Summary
 from pyiceberg.typedef import Record, TableVersion
-from pyiceberg.types import IntegerType, NestedField
+from pyiceberg.types import IntegerType, ListType, NestedField
 
 
 @pytest.fixture(autouse=True)
 def reset_global_manifests_cache() -> None:
     clear_manifest_cache()
+
+
+@pytest.mark.parametrize("format_version", [2, 3])
+def test_equality_ids_use_iceberg_int_wire_type(format_version: int) -> None:
+    equality_ids = DATA_FILE_TYPE[format_version].field_by_name("equality_ids")
+    assert isinstance(equality_ids.field_type, ListType)
+    assert isinstance(equality_ids.field_type.element_type, IntegerType)
 
 
 def _verify_metadata_with_fastavro(avro_file: str, expected_metadata: dict[str, str]) -> None:
