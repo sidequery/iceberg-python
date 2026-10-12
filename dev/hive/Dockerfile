@@ -22,19 +22,10 @@ ARG MAVEN_MIRROR=https://repo1.maven.org/maven2
 
 USER root
 
-# Install curl (separate layer - rarely changes)
-RUN apt-get update -qq && \
-    apt-get -qq -y install --no-install-recommends curl && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Download JARs with retry logic (slow layer - only changes when versions change)
-RUN curl -fsSL --retry 3 --retry-delay 5 \
-        -o /opt/hive/lib/hadoop-aws-${HADOOP_VERSION}.jar \
-        "${MAVEN_MIRROR}/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar" && \
-    curl -fsSL --retry 3 --retry-delay 5 \
-        -o /opt/hive/lib/aws-java-sdk-bundle-${AWS_SDK_BUNDLE}.jar \
-        "${MAVEN_MIRROR}/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE}.jar"
+# Download JARs (slow layer - only changes when versions change). ADD fetches them without curl, because the
+# image's Debian 11 security repository moved to archive.debian.org and apt-get can no longer install curl.
+ADD --chmod=644 ${MAVEN_MIRROR}/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar /opt/hive/lib/
+ADD --chmod=644 ${MAVEN_MIRROR}/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE}.jar /opt/hive/lib/
 
 # Copy configuration last (changes more frequently than JARs)
 COPY core-site.xml /opt/hadoop/etc/hadoop/core-site.xml
