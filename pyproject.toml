@@ -174,8 +174,10 @@ markers = [
 # Turns a warning into an error
 filterwarnings = [
   "error",
-  # Ignore Python version deprecation warning from google.api_core while we still support 3.10
-  "ignore:You are using a Python version.*which Google will stop supporting:FutureWarning:google.api_core",
+  # Ignore Python version support warnings from google.api_core while we still support 3.10. The wording changes
+  # by date: "which Google will stop supporting" before EOL, "past its end of life" during the one-week grace
+  # period, and "You are using a non-supported Python version" afterwards (3.10 reached that on 2026-10-12).
+  "ignore:You are using a (non-supported )?Python version:FutureWarning:google.api_core",
   # Python 3.13 sqlite3 module ResourceWarnings for unclosed database connections
   "ignore:unclosed database in <sqlite3.Connection object*:ResourceWarning",
   # Ignore Ray subprocess cleanup warnings
