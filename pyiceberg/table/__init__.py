@@ -86,7 +86,12 @@ from pyiceberg.table.update import (
     update_table_metadata,
 )
 from pyiceberg.table.update.schema import UpdateSchema
-from pyiceberg.table.update.snapshot import ManageSnapshots, UpdateSnapshot, _FastAppendFiles
+from pyiceberg.table.update.snapshot import (
+    ManageSnapshots,
+    UpdateSnapshot,
+    _FastAppendFiles,
+    _validate_equality_delete_spec,
+)
 from pyiceberg.table.update.sorting import UpdateSortOrder
 from pyiceberg.table.update.spec import UpdateSpec
 from pyiceberg.table.update.statistics import UpdateStatistics
@@ -1012,9 +1017,10 @@ class Transaction:
         Concurrent commits are ordered by their Iceberg snapshot sequence. A later
         equality-delete commit can remove matching rows from an earlier concurrent
         commit; rows committed later survive. Partitioned tables require every
-        partition source column in ``join_cols`` and currently reject evolved
-        partition specs because one partition-scoped delete cannot safely cover
-        data written under a different spec.
+        partition source column in ``join_cols``. After partition spec evolution,
+        every live data file on ``branch`` must already use the current spec (for
+        example after ``rewrite_data_files``), because a partition-scoped delete
+        only applies to data files written under the same spec.
         """
         try:
             import pyarrow as pa
@@ -1063,8 +1069,7 @@ class Transaction:
             raise ValueError("Duplicate rows found in source datasets based on the key columns. No upsert executed")
         if delete_rows.num_rows == 0:
             return
-        if not self.table_metadata.spec().is_unpartitioned() and len(self.table_metadata.specs()) > 1:
-            raise NotImplementedError("Equality-delete upserts do not yet support evolved partition specs")
+        _validate_equality_delete_spec(self.table_metadata, self._table.io, branch, self.table_metadata.default_spec_id)
 
         equality_ids = [
             self.table_metadata.schema().find_field(column_name, case_sensitive=case_sensitive).field_id

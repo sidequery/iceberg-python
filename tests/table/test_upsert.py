@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from datetime import datetime
 from pathlib import PosixPath
 
 import pyarrow as pa
@@ -23,7 +24,7 @@ from pyarrow import Table as pa_table
 from pytest_mock import MockerFixture
 
 from pyiceberg.catalog import Catalog
-from pyiceberg.exceptions import CommitFailedException, NoSuchTableError
+from pyiceberg.exceptions import CommitFailedException, NoSuchTableError, ValidationException
 from pyiceberg.expressions import AlwaysTrue, And, EqualTo, Reference
 from pyiceberg.expressions.literals import LongLiteral
 from pyiceberg.io.pyarrow import schema_to_pyarrow
@@ -33,8 +34,8 @@ from pyiceberg.schema import Schema
 from pyiceberg.table import Table, TableProperties, UpsertResult
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.table.upsert_util import create_match_filter
-from pyiceberg.transforms import IdentityTransform
-from pyiceberg.types import IntegerType, NestedField, StringType, StructType
+from pyiceberg.transforms import DayTransform, IdentityTransform, MonthTransform
+from pyiceberg.types import IntegerType, LongType, NestedField, StringType, StructType, TimestampType
 from tests.catalog.test_base import InMemoryCatalog
 
 
@@ -278,6 +279,137 @@ def test_partitioned_equality_delete_upsert_requires_partition_source_in_key(cat
     with pytest.raises(ValueError, match="require every partition source column"):
         table.upsert_by_equality_delete(source, join_cols=["id"])
     assert table.current_snapshot() is None
+
+
+_EVENTS_SCHEMA = Schema(
+    NestedField(1, "id", LongType(), required=True),
+    NestedField(2, "ts", TimestampType(), required=True),
+    NestedField(3, "value", StringType(), required=False),
+)
+_EVENTS_DAY_SPEC = PartitionSpec(PartitionField(2, 1000, DayTransform(), "ts_day"))
+
+
+def _events(rows: list[tuple[int, datetime, str]]) -> pa.Table:
+    return pa.table(
+        {
+            "id": [row[0] for row in rows],
+            "ts": [row[1] for row in rows],
+            "value": [row[2] for row in rows],
+        },
+        schema=schema_to_pyarrow(_EVENTS_SCHEMA, include_field_ids=False),
+    )
+
+
+def _sorted_events(table: Table, branch: str | None = None) -> list[tuple[int, str]]:
+    snapshot = table.metadata.snapshot_by_name(branch)
+    assert snapshot is not None
+    result = table.scan(snapshot_id=snapshot.snapshot_id).to_arrow().sort_by("id")
+    return list(zip(result.column("id").to_pylist(), result.column("value").to_pylist(), strict=True))
+
+
+def _evolve_day_to_month(table: Table) -> None:
+    with table.update_spec() as update:
+        update.remove_field("ts_day")
+        update.add_field("ts", MonthTransform(), "ts_month")
+
+
+def _rewrite_into_current_spec(table: Table) -> None:
+    table.overwrite(table.scan().to_arrow())
+
+
+_JAN_1 = datetime(2026, 1, 1, 12)
+_JAN_2 = datetime(2026, 1, 2, 12)
+
+
+def test_equality_delete_upsert_on_unevolved_partitioned_table(catalog: InMemoryCatalog) -> None:
+    table = catalog.create_table("default.equality_day_partitioned", _EVENTS_SCHEMA, partition_spec=_EVENTS_DAY_SPEC)
+    table.append(_events([(1, _JAN_1, "one"), (2, _JAN_2, "two")]))
+
+    table.upsert_by_equality_delete(_events([(2, _JAN_2, "updated"), (3, _JAN_2, "three")]), join_cols=["id", "ts"])
+
+    assert _sorted_events(table) == [(1, "one"), (2, "updated"), (3, "three")]
+
+
+def test_equality_delete_upsert_rejects_live_data_under_old_spec(catalog: InMemoryCatalog) -> None:
+    table = catalog.create_table("default.equality_evolved_old_data", _EVENTS_SCHEMA, partition_spec=_EVENTS_DAY_SPEC)
+    table.append(_events([(1, _JAN_1, "one")]))
+    _evolve_day_to_month(table)
+    table.append(_events([(2, _JAN_2, "two")]))
+    snapshot_before = table.current_snapshot()
+
+    with pytest.raises(
+        ValidationException, match=r"current partition spec 1, but data files remain under partition spec ids \[0\]"
+    ):
+        table.upsert_by_equality_delete(_events([(1, _JAN_1, "updated")]), join_cols=["id", "ts"])
+
+    assert table.current_snapshot() == snapshot_before
+    assert _sorted_events(table) == [(1, "one"), (2, "two")]
+
+
+def test_equality_delete_upsert_after_rewrite_into_evolved_spec(catalog: InMemoryCatalog) -> None:
+    table = catalog.create_table("default.equality_evolved_rewritten", _EVENTS_SCHEMA, partition_spec=_EVENTS_DAY_SPEC)
+    table.append(_events([(1, _JAN_1, "one"), (2, _JAN_2, "two")]))
+    # Leaves an equality-delete manifest under the old spec, which is dangling after the rewrite.
+    table.upsert_by_equality_delete(_events([(2, _JAN_2, "two-v2")]), join_cols=["id", "ts"])
+    _evolve_day_to_month(table)
+    _rewrite_into_current_spec(table)
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None
+    manifests = snapshot.manifests(table.io)
+    assert {m.partition_spec_id for m in manifests if m.content == ManifestContent.DELETES} == {0}
+    assert {m.partition_spec_id for m in manifests if m.content == ManifestContent.DATA and m.has_added_files()} == {1}
+
+    table.upsert_by_equality_delete(
+        _events([(1, _JAN_1, "one-v2"), (3, _JAN_2, "three")]),
+        join_cols=["id", "ts"],
+        delete_df=_events([(2, _JAN_2, "")]).select(["id", "ts"]),
+    )
+
+    assert _sorted_events(table) == [(1, "one-v2"), (3, "three")]
+    snapshot = table.current_snapshot()
+    assert snapshot is not None
+    new_delete_files = [
+        entry.data_file
+        for manifest in snapshot.manifests(table.io)
+        if manifest.content == ManifestContent.DELETES and manifest.added_snapshot_id == snapshot.snapshot_id
+        for entry in manifest.fetch_manifest_entry(table.io)
+    ]
+    assert new_delete_files
+    assert {data_file.spec_id for data_file in new_delete_files} == {1}
+
+
+def test_equality_delete_upsert_checks_target_branch_spec(catalog: InMemoryCatalog) -> None:
+    table = catalog.create_table("default.equality_evolved_branch", _EVENTS_SCHEMA, partition_spec=_EVENTS_DAY_SPEC)
+    table.append(_events([(1, _JAN_1, "one")]))
+    old_snapshot = table.current_snapshot()
+    assert old_snapshot is not None
+    table.manage_snapshots().create_branch(old_snapshot.snapshot_id, "stale").commit()
+    _evolve_day_to_month(table)
+    _rewrite_into_current_spec(table)
+
+    with pytest.raises(ValidationException, match=r"partition spec ids \[0\]"):
+        table.upsert_by_equality_delete(_events([(1, _JAN_1, "branch")]), join_cols=["id", "ts"], branch="stale")
+
+    table.upsert_by_equality_delete(_events([(1, _JAN_1, "main")]), join_cols=["id", "ts"])
+    assert _sorted_events(table) == [(1, "main")]
+    assert _sorted_events(table, branch="stale") == [(1, "one")]
+
+
+def test_equality_delete_upsert_revalidates_spec_on_retry(catalog: InMemoryCatalog) -> None:
+    table = catalog.create_table("default.equality_evolved_concurrent", _EVENTS_SCHEMA, partition_spec=_EVENTS_DAY_SPEC)
+    table.append(_events([(1, _JAN_1, "one")]))
+    stale_table = catalog.load_table("default.equality_evolved_concurrent")
+
+    # A concurrent writer evolves the spec and rewrites the data before the stale writer commits.
+    _evolve_day_to_month(table)
+    _rewrite_into_current_spec(table)
+
+    with pytest.raises(ValidationException, match="Default partition spec changed from 0 to 1"):
+        stale_table.upsert_by_equality_delete(_events([(1, _JAN_1, "stale")]), join_cols=["id", "ts"])
+
+    table.refresh()
+    assert _sorted_events(table) == [(1, "one")]
 
 
 @pytest.mark.parametrize(

@@ -97,6 +97,49 @@ def _new_manifest_list_file_name(snapshot_id: int, attempt: int, commit_uuid: uu
     return f"snap-{snapshot_id}-{attempt}-{commit_uuid}.avro"
 
 
+def _live_data_file_spec_ids(snapshot: Snapshot, io: FileIO) -> set[int]:
+    """Return the partition spec ids of live data files in a snapshot, read from manifest metadata."""
+    spec_ids: set[int] = set()
+    for manifest in snapshot.manifests(io):
+        if manifest.content != ManifestContent.DATA or manifest.partition_spec_id in spec_ids:
+            continue
+        if manifest.added_files_count is not None and manifest.existing_files_count is not None:
+            has_live_files = manifest.added_files_count + manifest.existing_files_count > 0
+        else:
+            has_live_files = len(manifest.fetch_manifest_entry(io, discard_deleted=True)) > 0
+        if has_live_files:
+            spec_ids.add(manifest.partition_spec_id)
+    return spec_ids
+
+
+def _validate_equality_delete_spec(table_metadata: TableMetadata, io: FileIO, branch: str | None, spec_id: int) -> None:
+    """Validate that equality deletes written under ``spec_id`` apply to every live data file on ``branch``.
+
+    A partitioned equality delete only applies to data files with the same spec id, so every live data
+    file must use that spec. An unpartitioned equality delete is global and applies to every data file.
+    Delete files under older partitioned specs do not block the upsert: they only apply to data files with
+    their own spec id, so once no data files remain under those specs they are dangling and have no effect
+    on reads.
+    """
+    if table_metadata.default_spec_id != spec_id:
+        raise ValidationException(
+            f"Default partition spec changed from {spec_id} to {table_metadata.default_spec_id} "
+            "while writing equality deletes; retry the upsert"
+        )
+    if table_metadata.specs()[spec_id].is_unpartitioned():
+        return
+    snapshot = table_metadata.snapshot_by_name(branch)
+    if snapshot is None:
+        return
+    other_spec_ids = sorted(_live_data_file_spec_ids(snapshot, io) - {spec_id})
+    if other_spec_ids:
+        raise ValidationException(
+            f"Equality-delete upserts require every live data file to use the current partition spec {spec_id}, "
+            f"but data files remain under partition spec ids {other_spec_ids}; "
+            "rewrite them into the current spec first (for example with rewrite_data_files)"
+        )
+
+
 @dataclass(frozen=True)
 class CommitWindow:
     """Tracks the commit range to validate against during retry.
@@ -713,6 +756,29 @@ class _FastAppendFiles(_SnapshotProducer["_FastAppendFiles"]):
         return []
 
 
+class _RowDeltaFiles(_FastAppendFiles):
+    """Fast append of data and delete files that re-validates equality-delete spec safety on retry."""
+
+    _spec_id: int
+
+    def __init__(
+        self,
+        operation: Operation,
+        transaction: Transaction,
+        io: FileIO,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+        branch: str | None = MAIN_BRANCH,
+    ) -> None:
+        super().__init__(operation, transaction, io, snapshot_properties=snapshot_properties, branch=branch)
+        # Added files are written under the default spec at the time the row delta starts.
+        self._spec_id = transaction.table_metadata.default_spec_id
+
+    def _validate_concurrency(self) -> None:
+        """Reject a retry when a concurrent commit left data that the added equality deletes cannot reach."""
+        if any(data_file.content == DataFileContent.EQUALITY_DELETES for data_file in self._added_data_files):
+            _validate_equality_delete_spec(self._transaction.table_metadata, self._io, self._target_branch, self._spec_id)
+
+
 class _MergeAppendFiles(_FastAppendFiles):
     _target_size_bytes: int
     _min_count_to_merge: int
@@ -892,9 +958,9 @@ class UpdateSnapshot:
             snapshot_properties=self._snapshot_properties,
         )
 
-    def row_delta(self) -> _FastAppendFiles:
+    def row_delta(self) -> _RowDeltaFiles:
         """Create a snapshot that atomically adds data and delete files."""
-        return _FastAppendFiles(
+        return _RowDeltaFiles(
             operation=Operation.OVERWRITE
             if self._transaction.table_metadata.snapshot_by_name(name=self._branch) is not None
             else Operation.APPEND,
