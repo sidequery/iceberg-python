@@ -5949,7 +5949,7 @@ wheels = [
 
 [[package]]
 name = "sidequery-pyiceberg"
-version = "0.12.0.post1"
+version = "0.12.0.post2"
 source = { editable = "." }
 dependencies = [
     { name = "cachetools" },

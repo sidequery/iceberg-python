@@ -16,7 +16,7 @@
 # under the License.
 [project]
 name = "sidequery-pyiceberg"
-version = "0.12.0.post1"
+version = "0.12.0.post2"
 description = "Sidequery's PyIceberg distribution with equality-delete read and write support"
 authors = [{ name = "Apache Software Foundation", email = "dev@iceberg.apache.org" }]
 maintainers = [{ name = "Sidequery", email = "hello@sidequery.com" }]
